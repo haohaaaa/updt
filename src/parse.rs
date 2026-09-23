@@ -159,26 +159,20 @@ impl ScoopStatusColumns {
 #[derive(Clone, Copy)]
 struct ScoopListColumns {
     version_start: usize,
-    info_start: usize,
+    info_start: Option<usize>,
 }
 
 impl ScoopListColumns {
     fn from_header(line: &str) -> Option<Self> {
         let version_start = line.find("Version")?;
         let source_start = line.find("Source")?;
-        let updated_start = line.find("Updated")?;
-        let info_start = line.find("Info")?;
-        if !line[..version_start].contains("Name")
-            || version_start >= source_start
-            || source_start >= updated_start
-            || updated_start >= info_start
-        {
+        if !line[..version_start].contains("Name") || version_start >= source_start {
             return None;
         }
 
         Some(Self {
             version_start,
-            info_start,
+            info_start: line.find("Info"),
         })
     }
 
@@ -187,7 +181,10 @@ impl ScoopListColumns {
         if name.is_empty() {
             return None;
         }
-        let info = slice_column(line, self.info_start, line.len()).trim();
+        let info = self
+            .info_start
+            .map(|start| slice_column(line, start, line.len()).trim())
+            .unwrap_or("");
         Some(ScoopListItem {
             name: name.to_string(),
             is_global: info.contains("Global install"),
@@ -447,6 +444,31 @@ git                      2.54.0     main   2026-04-25 12:58:13\n";
                 name: "git".to_string(),
                 is_global: false,
             }])
+        );
+    }
+
+    #[test]
+    fn parses_current_scoop_list_without_updated_and_info_columns() {
+        let output = "\
+Installed apps:\n\
+\n\
+Name                      Version            Source\n\
+----                      -------            ------\n\
+7zip                      26.03              main\n\
+clash-verge-rev           2.5.4              C:\\Users\\user\\scoop\\buckets\\extras\\bucket\n";
+
+        assert_eq!(
+            parse_scoop_list_output(output),
+            Ok(vec![
+                ScoopListItem {
+                    name: "7zip".to_string(),
+                    is_global: false,
+                },
+                ScoopListItem {
+                    name: "clash-verge-rev".to_string(),
+                    is_global: false,
+                },
+            ])
         );
     }
 
