@@ -1,10 +1,15 @@
 use serde_json::Value;
+use std::env;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use tokio::fs;
 
 use crate::command::{command_exists, run_capture, run_cargo_install_update_capture};
 use crate::output::{MsgKind, log_pkg_line};
-use crate::parse::{first_json_payload, first_token, parse_cargo_list, parse_scoop_status_output};
+use crate::parse::{
+    ScoopExportApp, first_json_payload, first_token, parse_cargo_list, parse_scoop_export_output,
+};
 use crate::profile::parse_profile;
 use crate::state::{AppState, SystemProfile};
 
@@ -552,14 +557,16 @@ async fn check_scoop_quiet(state: &mut AppState, logs: &mut Vec<String>) {
     }
     logs.push(log_pkg_line(
         "scoop",
-        "正在检查可升级项 (scoop status)...",
+        "正在检查可升级项 (scoop export)...",
         MsgKind::Info,
     ));
 
-    let Some(parsed) = load_scoop_status(&mut state.scoop.check_failed, logs).await else {
+    let Some(updatable_items) =
+        check_scoop_outdated_items(&mut state.scoop.check_failed, logs).await
+    else {
         return;
     };
-    record_scoop_status(state, logs, parsed);
+    record_scoop_updates(state, logs, updatable_items);
 }
 
 async fn refresh_scoop_metadata(check_failed: &mut bool, logs: &mut Vec<String>) -> bool {
@@ -591,15 +598,15 @@ async fn refresh_scoop_metadata(check_failed: &mut bool, logs: &mut Vec<String>)
     }
 }
 
-async fn load_scoop_status(
+async fn check_scoop_outdated_items(
     check_failed: &mut bool,
     logs: &mut Vec<String>,
-) -> Option<crate::parse::ScoopStatusOutput> {
-    let Ok((status, output)) = run_capture("scoop", &["status"]).await else {
+) -> Option<Vec<String>> {
+    let Ok((status, output)) = run_capture("scoop", &["export"]).await else {
         mark_check_failed(
             check_failed,
             "scoop",
-            "检查失败: 无法执行 scoop status.",
+            "检查失败: 无法执行 scoop export.",
             logs,
         );
         return None;
@@ -609,33 +616,139 @@ async fn load_scoop_status(
         mark_check_failed(
             check_failed,
             "scoop",
-            &format!("检查失败 (scoop status, exit {status})."),
+            &format!("检查失败 (scoop export, exit {status})."),
             logs,
         );
         return None;
     }
 
-    Some(parse_scoop_status_output(&output))
+    let Ok(apps) = parse_scoop_export_output(&output) else {
+        mark_check_failed(
+            check_failed,
+            "scoop",
+            "检查失败: scoop export 输出解析失败.",
+            logs,
+        );
+        return None;
+    };
+
+    let bucket_dirs = find_scoop_bucket_dirs().await;
+    let mut outdated = Vec::new();
+
+    for app in apps {
+        if app.is_held() {
+            continue;
+        }
+        if let Some(manifest_path) = find_manifest_for_app(&app, &bucket_dirs).await
+            && let Some(latest_version) = read_manifest_version(&manifest_path).await
+            && latest_version != app.version
+        {
+            outdated.push(app.name);
+        }
+    }
+
+    Some(outdated)
 }
 
-fn record_scoop_status(
+async fn find_scoop_bucket_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut root_paths = Vec::new();
+
+    if let Some(user_profile) = env::var_os("USERPROFILE") {
+        let config_file = PathBuf::from(&user_profile)
+            .join(".config")
+            .join("scoop")
+            .join("config.json");
+        if let Ok(content) = fs::read_to_string(&config_file).await
+            && let Ok(json) = serde_json::from_str::<Value>(&content)
+        {
+            if let Some(root) = json.get("root_path").and_then(Value::as_str) {
+                root_paths.push(PathBuf::from(root));
+            }
+            if let Some(global) = json.get("global_path").and_then(Value::as_str) {
+                root_paths.push(PathBuf::from(global));
+            }
+        }
+        root_paths.push(PathBuf::from(user_profile).join("scoop"));
+    }
+
+    if let Some(scoop_env) = env::var_os("SCOOP") {
+        root_paths.push(PathBuf::from(scoop_env));
+    }
+    if let Some(global_env) = env::var_os("SCOOP_GLOBAL") {
+        root_paths.push(PathBuf::from(global_env));
+    }
+    root_paths.push(PathBuf::from(r"C:\ProgramData\scoop"));
+
+    for root in root_paths {
+        let buckets = root.join("buckets");
+        if fs::metadata(&buckets).await.is_ok() && !dirs.contains(&buckets) {
+            dirs.push(buckets);
+        }
+    }
+
+    dirs
+}
+
+async fn find_manifest_for_app(app: &ScoopExportApp, bucket_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let file_name = format!("{}.json", app.name);
+
+    let source_path = PathBuf::from(&app.source);
+    if source_path.is_file() {
+        return Some(source_path);
+    }
+
+    if !app.source.is_empty() {
+        for b_dir in bucket_dirs {
+            let candidate1 = b_dir.join(&app.source).join("bucket").join(&file_name);
+            if fs::metadata(&candidate1).await.is_ok() {
+                return Some(candidate1);
+            }
+            let candidate2 = b_dir.join(&app.source).join(&file_name);
+            if fs::metadata(&candidate2).await.is_ok() {
+                return Some(candidate2);
+            }
+        }
+    }
+
+    for b_dir in bucket_dirs {
+        let mut entries = match fs::read_dir(b_dir).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let candidate1 = path.join("bucket").join(&file_name);
+            if fs::metadata(&candidate1).await.is_ok() {
+                return Some(candidate1);
+            }
+            let candidate2 = path.join(&file_name);
+            if fs::metadata(&candidate2).await.is_ok() {
+                return Some(candidate2);
+            }
+        }
+    }
+
+    None
+}
+
+async fn read_manifest_version(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).await.ok()?;
+    let json = serde_json::from_str::<Value>(&content).ok()?;
+    json.get("version")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn record_scoop_updates(
     state: &mut AppState,
     logs: &mut Vec<String>,
-    parsed: crate::parse::ScoopStatusOutput,
+    updatable_items: Vec<String>,
 ) {
-    let metadata_outdated = parsed.metadata_outdated;
-    state.scoop.updatable_items = parsed.updatable_items;
+    state.scoop.updatable_items = updatable_items;
 
     if state.scoop.updatable_items.is_empty() {
-        if metadata_outdated {
-            logs.push(log_pkg_line(
-                "scoop",
-                "检查期间 Scoop/桶元数据再次发生变化，请重新运行检查.",
-                MsgKind::Warn,
-            ));
-        } else {
-            logs.push(log_pkg_line("scoop", "已是最新.", MsgKind::Ok));
-        }
+        logs.push(log_pkg_line("scoop", "已是最新.", MsgKind::Ok));
     } else {
         state.scoop.has_updates = true;
         log_item_list(logs, "scoop", "以下包可升级:", &state.scoop.updatable_items);
