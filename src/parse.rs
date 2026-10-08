@@ -105,203 +105,77 @@ fn cargo_package_update(name: &str, needs_update: &str) -> Result<Option<String>
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct ScoopStatusOutput {
-    pub updatable_items: Vec<String>,
-    pub metadata_outdated: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoopExportApp {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub info: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScoopListItem {
-    pub name: String,
-    pub is_global: bool,
+impl ScoopExportApp {
+    #[cfg(test)]
+    pub fn new(name: &str, is_global: bool) -> Self {
+        Self {
+            name: name.to_string(),
+            version: String::new(),
+            source: String::new(),
+            info: if is_global {
+                "Global install".to_string()
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    pub fn is_global(&self) -> bool {
+        self.info.contains("Global install")
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.info.contains("Held package")
+    }
+}
+
+pub fn parse_scoop_export_output(output: &str) -> Result<Vec<ScoopExportApp>, ()> {
+    let json_text = first_json_payload(output).unwrap_or(output);
+    let root = serde_json::from_str::<serde_json::Value>(json_text).map_err(|_| ())?;
+    let apps = root.get("apps").and_then(|v| v.as_array()).ok_or(())?;
+    let mut items = Vec::with_capacity(apps.len());
+    for item in apps {
+        let name = item
+            .get("Name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let version = item
+            .get("Version")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let source = item
+            .get("Source")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let info = item
+            .get("Info")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        items.push(ScoopExportApp {
+            name: name.to_string(),
+            version: version.to_string(),
+            source: source.to_string(),
+            info: info.to_string(),
+        });
+    }
+    Ok(items)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScoopBlockedProcessInfo {
     pub app_name: Option<String>,
     pub details: Vec<String>,
-}
-
-#[derive(Clone, Copy)]
-struct ScoopStatusColumns {
-    installed_start: usize,
-    latest_start: usize,
-    latest_end: usize,
-}
-
-impl ScoopStatusColumns {
-    fn from_header(line: &str) -> Option<Self> {
-        let installed_start = line.find("Installed Version")?;
-        let latest_start = line.find("Latest Version")?;
-        if !line[..installed_start].contains("Name") {
-            return None;
-        }
-
-        let latest_end = line
-            .find("Missing Dependencies")
-            .or_else(|| line.find("Info"))
-            .unwrap_or(line.len());
-        Some(Self {
-            installed_start,
-            latest_start,
-            latest_end,
-        })
-    }
-
-    fn outdated_name(self, line: &str) -> Option<String> {
-        let name = slice_column(line, 0, self.installed_start).trim();
-        let latest = slice_column(line, self.latest_start, self.latest_end).trim();
-        (!name.is_empty() && !latest.is_empty()).then(|| name.to_string())
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ScoopListColumns {
-    version_start: usize,
-    info_start: Option<usize>,
-}
-
-impl ScoopListColumns {
-    fn from_header(line: &str) -> Option<Self> {
-        let version_start = line.find("Version")?;
-        let source_start = line.find("Source")?;
-        if !line[..version_start].contains("Name") || version_start >= source_start {
-            return None;
-        }
-
-        Some(Self {
-            version_start,
-            info_start: line.find("Info"),
-        })
-    }
-
-    fn parse_item(self, line: &str) -> Option<ScoopListItem> {
-        let name = slice_column(line, 0, self.version_start).trim();
-        if name.is_empty() {
-            return None;
-        }
-        let info = self
-            .info_start
-            .map(|start| slice_column(line, start, line.len()).trim())
-            .unwrap_or("");
-        Some(ScoopListItem {
-            name: name.to_string(),
-            is_global: info.contains("Global install"),
-        })
-    }
-}
-
-fn slice_column(line: &str, start: usize, end: usize) -> &str {
-    let len = line.len();
-    if start >= len || start >= end {
-        return "";
-    }
-    let end = end.min(len);
-    line.get(start..end).unwrap_or("")
-}
-
-fn is_scoop_status_separator(line: &str) -> bool {
-    line.chars().all(|ch| ch == '-' || ch == ' ' || ch == '\t')
-}
-
-fn is_scoop_status_noise(line: &str) -> bool {
-    matches!(
-        line,
-        "Everything is ok!" | "Scoop is up to date." | "Scoop was updated successfully!"
-    )
-}
-
-fn is_scoop_list_noise(line: &str) -> bool {
-    line == "Installed apps:"
-}
-
-pub fn parse_scoop_status_output(output: &str) -> ScoopStatusOutput {
-    let cleaned = strip_ansi_control_sequences(output);
-    let mut parsed = ScoopStatusOutput::default();
-    let mut columns = None;
-
-    for raw in cleaned.lines() {
-        let line = raw.trim_end();
-        let trimmed = line.trim();
-        if trimmed.is_empty() || is_scoop_status_noise(trimmed) {
-            continue;
-        }
-
-        if trimmed.starts_with("WARN") {
-            if trimmed.contains("Scoop out of date") || trimmed.contains("bucket(s) out of date") {
-                parsed.metadata_outdated = true;
-            }
-            continue;
-        }
-
-        if let Some(header) = ScoopStatusColumns::from_header(line) {
-            columns = Some(header);
-            continue;
-        }
-        if is_scoop_status_separator(trimmed) {
-            continue;
-        }
-
-        if let Some(columns) = columns {
-            if let Some(name) = columns.outdated_name(line)
-                && !parsed.updatable_items.iter().any(|item| item == &name)
-            {
-                parsed.updatable_items.push(name);
-            }
-            continue;
-        }
-
-        if let Some(name) = first_token(trimmed)
-            && !matches!(name.as_str(), "Name" | "----")
-            && !parsed.updatable_items.iter().any(|item| item == &name)
-        {
-            parsed.updatable_items.push(name);
-        }
-    }
-
-    parsed
-}
-
-pub fn parse_scoop_list_output(output: &str) -> Result<Vec<ScoopListItem>, ()> {
-    let cleaned = strip_ansi_control_sequences(output);
-    let mut items = Vec::new();
-    let mut columns = None;
-    let mut saw_content = false;
-
-    for raw in cleaned.lines() {
-        let line = raw.trim_end();
-        let trimmed = line.trim();
-        if trimmed.is_empty() || is_scoop_list_noise(trimmed) {
-            continue;
-        }
-        saw_content = true;
-
-        if let Some(header) = ScoopListColumns::from_header(line) {
-            columns = Some(header);
-            continue;
-        }
-        if is_scoop_status_separator(trimmed) {
-            continue;
-        }
-
-        let Some(columns) = columns else {
-            return Err(());
-        };
-        let Some(item) = columns.parse_item(line) else {
-            return Err(());
-        };
-        items.push(item);
-    }
-
-    if !saw_content {
-        return Ok(items);
-    }
-    if columns.is_none() {
-        return Err(());
-    }
-
-    Ok(items)
 }
 
 pub fn parse_scoop_blocked_process_output(output: &str) -> Option<ScoopBlockedProcessInfo> {
@@ -378,159 +252,75 @@ pub fn strip_ansi_control_sequences(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ScoopBlockedProcessInfo, ScoopListItem, ScoopStatusOutput,
-        parse_scoop_blocked_process_output, parse_scoop_list_output, parse_scoop_status_output,
+        ScoopBlockedProcessInfo, ScoopExportApp, parse_scoop_blocked_process_output,
+        parse_scoop_export_output,
     };
 
     #[test]
-    fn parses_scoop_status_table_outdated_items() {
-        let output = "\
-Scoop is up to date.\n\
-\n\
-Name          Installed Version Latest Version Missing Dependencies Info\n\
-----          ----------------- -------------- -------------------- ----\n\
-7zip          24.09             25.01\n\
-git           2.45.2.windows.1  2.46.0.windows.1\n\
-dependency    1.0                              innounp\n";
-
-        assert_eq!(
-            parse_scoop_status_output(output),
-            ScoopStatusOutput {
-                updatable_items: vec!["7zip".to_string(), "git".to_string()],
-                metadata_outdated: false,
-            }
-        );
+    fn creates_scoop_export_app() {
+        let app = ScoopExportApp::new("git", true);
+        assert_eq!(app.name, "git");
+        assert!(app.is_global());
+        assert!(!app.is_held());
     }
 
     #[test]
-    fn detects_scoop_metadata_outdated_warning() {
-        let output =
-            "WARN  Scoop bucket(s) out of date. Run 'scoop update' to get the latest changes.\n";
-
-        assert_eq!(
-            parse_scoop_status_output(output),
-            ScoopStatusOutput {
-                updatable_items: Vec::new(),
-                metadata_outdated: true,
-            }
-        );
-    }
-
-    #[test]
-    fn supports_legacy_name_only_scoop_status_output() {
-        let output = "7zip\ngit\n";
-
-        assert_eq!(
-            parse_scoop_status_output(output),
-            ScoopStatusOutput {
-                updatable_items: vec!["7zip".to_string(), "git".to_string()],
-                metadata_outdated: false,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_scoop_list_local_only_item() {
-        let output = "\
-Installed apps:\n\
-\n\
-Name                     Version    Source Updated             Info\n\
-----                     -------    ------ -------             ----\n\
-git                      2.54.0     main   2026-04-25 12:58:13\n";
-
-        assert_eq!(
-            parse_scoop_list_output(output),
-            Ok(vec![ScoopListItem {
-                name: "git".to_string(),
-                is_global: false,
-            }])
-        );
-    }
-
-    #[test]
-    fn parses_current_scoop_list_without_updated_and_info_columns() {
-        let output = "\
-Installed apps:\n\
-\n\
-Name                      Version            Source\n\
-----                      -------            ------\n\
-7zip                      26.03              main\n\
-clash-verge-rev           2.5.4              C:\\Users\\user\\scoop\\buckets\\extras\\bucket\n";
-
-        assert_eq!(
-            parse_scoop_list_output(output),
-            Ok(vec![
-                ScoopListItem {
-                    name: "7zip".to_string(),
-                    is_global: false,
+    fn parses_scoop_export_apps() {
+        let output = r#"{
+            "apps": [
+                {
+                    "Name": "7zip",
+                    "Version": "26.03",
+                    "Source": "main",
+                    "Info": ""
                 },
-                ScoopListItem {
-                    name: "clash-verge-rev".to_string(),
-                    is_global: false,
+                {
+                    "Name": "git",
+                    "Version": "2.54.0",
+                    "Source": "main",
+                    "Info": "Global install"
                 },
-            ])
-        );
+                {
+                    "Name": "curl",
+                    "Version": "8.0.0",
+                    "Source": "main",
+                    "Info": "Held package"
+                }
+            ]
+        }"#;
+
+        let apps = parse_scoop_export_output(output).unwrap();
+        assert_eq!(apps.len(), 3);
+        assert_eq!(apps[0].name, "7zip");
+        assert!(!apps[0].is_global());
+        assert!(!apps[0].is_held());
+
+        assert_eq!(apps[1].name, "git");
+        assert!(apps[1].is_global());
+        assert!(!apps[1].is_held());
+
+        assert_eq!(apps[2].name, "curl");
+        assert!(!apps[2].is_global());
+        assert!(apps[2].is_held());
     }
 
     #[test]
-    fn parses_scoop_list_global_only_item() {
-        let output = "\
-Installed apps:\n\
-\n\
-Name                     Version    Source Updated             Info\n\
-----                     -------    ------ -------             ----\n\
-git                      2.54.0     main   2026-04-25 12:58:13 Global install\n";
-
-        assert_eq!(
-            parse_scoop_list_output(output),
-            Ok(vec![ScoopListItem {
-                name: "git".to_string(),
-                is_global: true,
-            }])
-        );
-    }
-
-    #[test]
-    fn parses_scoop_list_same_app_in_local_and_global_scope() {
-        let output = "\
-Installed apps:\n\
-\n\
-Name                     Version    Source Updated             Info\n\
-----                     -------    ------ -------             ----\n\
-git                      2.54.0     main   2026-04-25 12:58:13\n\
-git                      2.54.0     main   2026-04-25 12:58:14 Global install\n";
-
-        assert_eq!(
-            parse_scoop_list_output(output),
-            Ok(vec![
-                ScoopListItem {
-                    name: "git".to_string(),
-                    is_global: false,
-                },
-                ScoopListItem {
-                    name: "git".to_string(),
-                    is_global: true,
-                },
-            ])
-        );
-    }
-
-    #[test]
-    fn parses_scoop_list_without_global_marker() {
-        let output = "\
-Installed apps:\n\
-\n\
-Name                     Version    Source Updated             Info\n\
-----                     -------    ------ -------             ----\n\
-git                      2.54.0     main   2026-04-25 12:58:13 Deprecated package\n";
-
-        assert_eq!(
-            parse_scoop_list_output(output),
-            Ok(vec![ScoopListItem {
-                name: "git".to_string(),
-                is_global: false,
-            }])
-        );
+    fn parses_scoop_export_apps_with_leading_noise() {
+        let output = r#"WARN  Scoop bucket(s) out of date.
+{
+    "apps": [
+        {
+            "Name": "nodejs",
+            "Version": "22.0.0"
+        }
+    ]
+}"#;
+        let apps = parse_scoop_export_output(output).unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "nodejs");
+        assert_eq!(apps[0].version, "22.0.0");
+        assert!(!apps[0].is_global());
+        assert!(!apps[0].is_held());
     }
 
     #[test]

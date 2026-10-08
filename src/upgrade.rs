@@ -2,12 +2,12 @@ use crate::command::{
     command_exists, run_capture, run_capture_streaming, run_cargo_install_update_inherit,
     run_inherit,
 };
-use crate::output::{err_text, ok_text, print_section};
+use crate::output::{err_text, ok_text, print_section, warn_text};
 #[cfg(windows)]
 use crate::parse::strip_ansi_control_sequences;
 use crate::parse::{
-    ScoopBlockedProcessInfo, ScoopListItem, parse_scoop_blocked_process_output,
-    parse_scoop_list_output,
+    ScoopBlockedProcessInfo, ScoopExportApp, parse_scoop_blocked_process_output,
+    parse_scoop_export_output,
 };
 use crate::profile::{desktop_linux_session, interactive_terminal};
 use crate::selection::{ScoopBlockedAction, prompt_scoop_blocked_action};
@@ -554,11 +554,11 @@ enum ScoopTaskOutcome {
 
 fn build_scoop_update_tasks(
     updatable_items: &[String],
-    installed_items: &[ScoopListItem],
+    installed_items: &[ScoopExportApp],
 ) -> Vec<ScoopUpdateTask> {
     let mut scopes_by_name = HashMap::<&str, Vec<ScoopInstallScope>>::new();
     for item in installed_items {
-        let scope = if item.is_global {
+        let scope = if item.is_global() {
             ScoopInstallScope::Global
         } else {
             ScoopInstallScope::Local
@@ -613,8 +613,13 @@ async fn scoop_update_tasks_for_state(state: &AppState) -> Option<Vec<ScoopUpdat
     let installed_items = match load_scoop_installed_items().await {
         Ok(items) => items,
         Err(err) => {
-            println!("[scoop] 无法解析已安装包列表: {err}");
-            return None;
+            println!(
+                "{}",
+                warn_text(&format!(
+                    "[scoop] 无法获取已安装包详细清单 ({err}), 默认按用户范围执行升级."
+                ))
+            );
+            Vec::new()
         }
     };
     let tasks = build_scoop_update_tasks(&state.scoop.updatable_items, &installed_items);
@@ -694,12 +699,14 @@ fn print_nonempty_scoop_list(should_print: bool, header: &str, items: &[String])
     }
 }
 
-async fn load_scoop_installed_items() -> io::Result<Vec<ScoopListItem>> {
-    let (status, output) = run_capture("scoop", &["list"]).await?;
+async fn load_scoop_installed_items() -> io::Result<Vec<ScoopExportApp>> {
+    let (status, output) = run_capture("scoop", &["export"]).await?;
     if status != 0 {
-        return Err(io::Error::other(format!("scoop list 失败 (exit {status})")));
+        return Err(io::Error::other(format!(
+            "scoop export 失败 (exit {status})"
+        )));
     }
-    parse_scoop_list_output(&output).map_err(|_| io::Error::other("scoop list 输出解析失败"))
+    parse_scoop_export_output(&output).map_err(|_| io::Error::other("scoop export 输出解析失败"))
 }
 
 async fn run_scoop_update_task(task: &ScoopUpdateTask, allow_prompt: bool) -> ScoopTaskOutcome {
@@ -1337,7 +1344,7 @@ mod tests {
         RUSTUP_UPDATE_ARGS, ScoopInstallScope, ScoopUpdateTask, TerminalFocusState,
         UpgradeFailures, build_scoop_update_tasks, paru_password_attention_reason,
     };
-    use crate::parse::ScoopListItem;
+    use crate::parse::ScoopExportApp;
 
     #[test]
     fn records_failure_labels_once() {
@@ -1380,13 +1387,8 @@ mod tests {
 
     #[test]
     fn builds_one_local_scoop_task() {
-        let tasks = build_scoop_update_tasks(
-            &[String::from("git")],
-            &[ScoopListItem {
-                name: "git".to_string(),
-                is_global: false,
-            }],
-        );
+        let tasks =
+            build_scoop_update_tasks(&[String::from("git")], &[ScoopExportApp::new("git", false)]);
 
         assert_eq!(
             tasks,
@@ -1399,13 +1401,8 @@ mod tests {
 
     #[test]
     fn builds_one_global_scoop_task() {
-        let tasks = build_scoop_update_tasks(
-            &[String::from("git")],
-            &[ScoopListItem {
-                name: "git".to_string(),
-                is_global: true,
-            }],
-        );
+        let tasks =
+            build_scoop_update_tasks(&[String::from("git")], &[ScoopExportApp::new("git", true)]);
 
         assert_eq!(
             tasks,
@@ -1421,14 +1418,8 @@ mod tests {
         let tasks = build_scoop_update_tasks(
             &[String::from("git")],
             &[
-                ScoopListItem {
-                    name: "git".to_string(),
-                    is_global: false,
-                },
-                ScoopListItem {
-                    name: "git".to_string(),
-                    is_global: true,
-                },
+                ScoopExportApp::new("git", false),
+                ScoopExportApp::new("git", true),
             ],
         );
 
