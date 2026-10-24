@@ -14,13 +14,14 @@ pub struct TargetStateFlags {
     pub needs_cargo_updater: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SystemProfile {
     #[default]
     Unknown,
     Windows,
     Macos,
     Arch,
+    Asahi,
     Termux,
 }
 
@@ -59,6 +60,7 @@ pub struct EnablePolicy {
     pub scoop: bool,
     pub paru: bool,
     pub pacman: bool,
+    pub dnf: bool,
     pub flatpak: bool,
     pub pkg: bool,
 }
@@ -73,8 +75,10 @@ pub struct AppState {
     pub paru: TargetBucketState,
     pub flatpak: TargetBucketState,
     pub pacman: TargetBucketState,
+    pub dnf: TargetBucketState,
     pub pkg: TargetBucketState,
     pub is_arch_linux: bool,
+    pub is_asahi_linux: bool,
     pub is_termux: bool,
     pub system_profile: SystemProfile,
     pub enable: EnablePolicy,
@@ -86,6 +90,7 @@ pub fn profile_name(profile: SystemProfile) -> &'static str {
         (SystemProfile::Windows, "windows"),
         (SystemProfile::Macos, "macos"),
         (SystemProfile::Arch, "arch"),
+        (SystemProfile::Asahi, "asahi"),
         (SystemProfile::Termux, "termux"),
     ];
     NAMES

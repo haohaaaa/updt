@@ -1,12 +1,12 @@
 [package]
 name = "updt"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2024"
-description = "Cross-platform update helper for npm, cargo, rustup, scoop, Homebrew, paru, flatpak, pacman, and pkg."
+description = "Cross-platform update helper for npm, cargo, rustup, scoop, Homebrew, paru, flatpak, pacman, DNF, and pkg."
 license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/jihaohaaaa/updt"
-repository = "https://github.com/jihaohaaaa/updt"
+homepage = "https://github.com/haohaaaa/updt"
+repository = "https://github.com/haohaaaa/updt"
 documentation = "https://docs.rs/updt"
 keywords = ["update", "system", "package-manager", "cli", "automation"]
 categories = ["command-line-utilities"]

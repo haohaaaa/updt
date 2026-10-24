@@ -2,12 +2,12 @@
 
 [![Crates.io](https://img.shields.io/crates/v/updt.svg)](https://crates.io/crates/updt)
 [![Docs.rs](https://docs.rs/updt/badge.svg)](https://docs.rs/updt)
-[![CI](https://github.com/jihaohaaaa/updt/actions/workflows/ci.yml/badge.svg)](https://github.com/jihaohaaaa/updt/actions/workflows/ci.yml)
+[![CI](https://github.com/haohaaaa/updt/actions/workflows/ci.yml/badge.svg)](https://github.com/haohaaaa/updt/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 `updt` is a Rust command-line tool that checks and runs updates across your development package managers from one interactive workflow.
 
-Instead of remembering separate update commands for Homebrew, npm, cargo, rustup, Scoop, paru, pacman, Flatpak, and Termux `pkg`, run `updt`, review what has updates, choose the targets you want, and let the original package managers do the work.
+Instead of remembering separate update commands for Homebrew, npm, cargo, rustup, Scoop, paru, pacman, DNF, Flatpak, and Termux `pkg`, run `updt`, review what has updates, choose the targets you want, and let the original package managers do the work.
 
 ```bash
 cargo install updt
@@ -18,7 +18,7 @@ updt
 
 - Crates.io package: https://crates.io/crates/updt
 - API documentation: https://docs.rs/updt
-- GitHub repository: https://github.com/jihaohaaaa/updt
+- GitHub repository: https://github.com/haohaaaa/updt
 
 ## What It Does
 
@@ -31,7 +31,7 @@ It checks supported targets in parallel, shows the results in a terminal selecto
 - One command for routine update checks across multiple ecosystems.
 - Interactive selection before anything is upgraded.
 - Direct target updates for scripts or muscle memory, such as `updt update npm cargo`.
-- Platform-aware defaults for macOS, Windows, Arch Linux, and Termux.
+- Platform-aware defaults for macOS, Windows, Arch Linux, Fedora Asahi Remix, and Termux.
 - Small Rust binary with no shell script bootstrap step.
 
 ## Quick Start
@@ -80,6 +80,7 @@ updt fish
 | `rustup` | Rust toolchains | Requires `rustup` |
 | `scoop` | Scoop packages | Windows profile |
 | `paru` | AUR packages | Arch Linux profile |
+| `dnf` | Fedora system packages | Fedora Asahi Remix profile |
 | `flatpak` | Flatpak apps | Arch Linux profile |
 | `pacman` | pacman packages | Arch Linux profile |
 | `pkg` | Termux packages | Termux profile |
@@ -95,6 +96,7 @@ Windows system package managers `winget` and `choco` are intentionally unsupport
 | macOS | `brew`, `npm`, `cargo`, `rustup` |
 | Windows | `npm`, `cargo`, `rustup`, `scoop` |
 | Arch Linux | `npm`, `cargo`, `rustup`, `paru`, `pacman`, `flatpak` |
+| Fedora Asahi Remix | `dnf`, `npm`, `cargo`, `rustup`, `flatpak` |
 | Termux | `pkg`, `npm`, `cargo` |
 | Other systems | None |
 
@@ -112,6 +114,7 @@ Target-specific notes:
 
 - `cargo` checks require `cargo-install-update` in `PATH`.
 - `cargo-binstall` is recommended for faster binary installation of cargo-managed tools, except on Android (Termux).
+- `dnf` upgrades may use `sudo` or `pkexec`, depending on terminal focus and desktop session state.
 - Termux `pkg` checks use `apt list --upgradable`.
 - `pacman` upgrades may use `sudo` or `pkexec`, depending on terminal focus and desktop session state.
 

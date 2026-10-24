@@ -1,7 +1,7 @@
 use super::{AppState, TargetStateFlags};
 
-pub const TARGET_IDS: [&str; 9] = [
-    "brew", "npm", "cargo", "rustup", "scoop", "paru", "flatpak", "pacman", "pkg",
+pub const TARGET_IDS: [&str; 10] = [
+    "brew", "npm", "cargo", "rustup", "scoop", "paru", "flatpak", "pacman", "dnf", "pkg",
 ];
 
 struct TargetMeta {
@@ -13,7 +13,7 @@ struct TargetMeta {
     items: fn(&AppState) -> Vec<String>,
 }
 
-const TARGET_META: [TargetMeta; 9] = [
+const TARGET_META: [TargetMeta; 10] = [
     TargetMeta {
         id: "brew",
         label: "Homebrew",
@@ -77,6 +77,14 @@ const TARGET_META: [TargetMeta; 9] = [
         update_summary: "发现可升级项",
         flags: pacman_flags,
         items: pacman_items,
+    },
+    TargetMeta {
+        id: "dnf",
+        label: "DNF",
+        section: "DNF",
+        update_summary: "发现可升级项",
+        flags: dnf_flags,
+        items: dnf_items,
     },
     TargetMeta {
         id: "pkg",
@@ -210,6 +218,15 @@ fn pacman_flags(state: &AppState) -> TargetStateFlags {
     )
 }
 
+fn dnf_flags(state: &AppState) -> TargetStateFlags {
+    bucket_flags(
+        state.enable.dnf,
+        state.dnf.installed,
+        state.dnf.check_failed,
+        state.dnf.has_updates,
+    )
+}
+
 fn pkg_flags(state: &AppState) -> TargetStateFlags {
     bucket_flags(
         state.enable.pkg,
@@ -257,6 +274,10 @@ fn pacman_items(state: &AppState) -> Vec<String> {
     state.pacman.updatable_items.clone()
 }
 
+fn dnf_items(state: &AppState) -> Vec<String> {
+    state.dnf.updatable_items.clone()
+}
+
 fn pkg_items(state: &AppState) -> Vec<String> {
     state.pkg.updatable_items.clone()
 }
@@ -264,14 +285,15 @@ fn pkg_items(state: &AppState) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        section_title, target_enabled, target_label, target_state_flags, target_update_summary,
-        updatable_items_for_target,
+        TARGET_IDS, section_title, target_enabled, target_label, target_state_flags,
+        target_update_summary, updatable_items_for_target,
     };
     use crate::state::AppState;
 
     #[test]
     fn returns_target_metadata_and_unknown_defaults() {
         assert_eq!(target_label("brew"), "Homebrew");
+        assert_eq!(target_label("dnf"), "DNF");
         assert_eq!(section_title("pkg"), "pkg (Termux)");
         assert_eq!(target_label("missing"), "unknown");
         assert_eq!(target_update_summary("missing"), "发现可升级项");
@@ -286,6 +308,26 @@ mod tests {
         assert!(target_enabled(&state, "rustup"));
         assert!(!target_enabled(&state, "brew"));
         assert!(!target_enabled(&state, "missing"));
+    }
+
+    #[test]
+    fn dnf_target_metadata_uses_dnf_state() {
+        let mut state = AppState::default();
+        state.enable.dnf = true;
+        state.dnf.installed = true;
+        state.dnf.has_updates = true;
+        state.dnf.updatable_items = vec!["kernel.aarch64".to_string()];
+
+        let flags = target_state_flags(&state, "dnf").expect("dnf target flags");
+
+        assert!(flags.enabled);
+        assert!(flags.installed);
+        assert!(flags.has_updates);
+        assert_eq!(
+            updatable_items_for_target(&state, "dnf"),
+            ["kernel.aarch64"]
+        );
+        assert!(TARGET_IDS.contains(&"dnf"));
     }
 
     #[test]

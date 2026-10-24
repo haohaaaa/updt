@@ -104,6 +104,7 @@ check_runner!(run_scoop_check, check_scoop_quiet);
 check_runner!(run_paru_check, check_paru_quiet);
 check_runner!(run_flatpak_check, check_flatpak_quiet);
 check_runner!(run_pacman_check, check_pacman_quiet);
+check_runner!(run_dnf_check, check_dnf_quiet);
 check_runner!(run_pkg_check, check_pkg_quiet);
 
 fn merge_brew_check(state: &mut AppState, local: AppState) {
@@ -136,6 +137,10 @@ fn merge_flatpak_check(state: &mut AppState, local: AppState) {
 
 fn merge_pacman_check(state: &mut AppState, local: AppState) {
     state.pacman = local.pacman;
+}
+
+fn merge_dnf_check(state: &mut AppState, local: AppState) {
+    state.dnf = local.dnf;
 }
 
 fn merge_pkg_check(state: &mut AppState, local: AppState) {
@@ -182,6 +187,11 @@ static CHECK_TARGET_HANDLERS: &[CheckTargetHandler] = &[
         target: "pacman",
         check: run_pacman_check,
         merge: merge_pacman_check,
+    },
+    CheckTargetHandler {
+        target: "dnf",
+        check: run_dnf_check,
+        merge: merge_dnf_check,
     },
     CheckTargetHandler {
         target: "pkg",
@@ -905,6 +915,76 @@ async fn check_pacman_quiet(state: &mut AppState, logs: &mut Vec<String>) {
     );
 }
 
+async fn check_dnf_quiet(state: &mut AppState, logs: &mut Vec<String>) {
+    if !ensure_check_target(
+        state.enable.dnf,
+        &mut state.dnf.installed,
+        "dnf",
+        "dnf",
+        logs,
+    )
+    .await
+    {
+        return;
+    }
+
+    logs.push(log_pkg_line(
+        "dnf",
+        "正在检查可升级项 (dnf check-update --quiet)...",
+        MsgKind::Info,
+    ));
+    let (status, output) = match run_capture("dnf", &["check-update", "--quiet"]).await {
+        Ok(result) => result,
+        Err(_) => {
+            mark_check_failed(
+                &mut state.dnf.check_failed,
+                "dnf",
+                "检查失败: 无法执行 dnf 命令.",
+                logs,
+            );
+            return;
+        }
+    };
+
+    if !dnf_status_is_success(status) {
+        mark_check_failed(
+            &mut state.dnf.check_failed,
+            "dnf",
+            &format!("检查失败 (dnf check-update --quiet, exit {status})."),
+            logs,
+        );
+        return;
+    }
+
+    state.dnf.updatable_items = if dnf_status_has_updates(status) {
+        package_names_from_lines(&output)
+    } else {
+        Vec::new()
+    };
+    if dnf_status_has_updates(status) {
+        state.dnf.has_updates = true;
+        if state.dnf.updatable_items.is_empty() {
+            logs.push(log_pkg_line(
+                "dnf",
+                "DNF 报告有可升级项, 但未能解析包列表.",
+                MsgKind::Warn,
+            ));
+        } else {
+            log_item_list(logs, "dnf", "以下包可升级:", &state.dnf.updatable_items);
+        }
+    } else {
+        logs.push(log_pkg_line("dnf", "已是最新.", MsgKind::Ok));
+    }
+}
+
+fn dnf_status_is_success(status: i32) -> bool {
+    status == 0 || status == 100
+}
+
+fn dnf_status_has_updates(status: i32) -> bool {
+    status == 100
+}
+
 async fn load_pacman_updates(use_checkupdates: bool) -> (i32, String) {
     if use_checkupdates {
         run_capture("checkupdates", &[])
@@ -1045,6 +1125,7 @@ pub fn merge_check_result(state: &mut AppState, target: &str, local: AppState) {
 #[cfg(test)]
 mod tests {
     use super::{
+        dnf_status_has_updates, dnf_status_is_success, ensure_check_target,
         is_identical_rustup_update, package_names_from_lines, pacman_status_means_no_updates,
         pkg_updatable_name, pkg_updatable_names, record_rustup_status,
         rustup_toolchains_include_windows_gnu,
@@ -1131,6 +1212,51 @@ mod tests {
         assert!(pacman_status_means_no_updates(1, "", false));
         assert!(!pacman_status_means_no_updates(1, "pacman 1 -> 2", false));
         assert!(!pacman_status_means_no_updates(0, "", true));
+    }
+
+    #[test]
+    fn recognizes_dnf_check_update_exit_codes() {
+        assert!(dnf_status_is_success(0));
+        assert!(!dnf_status_has_updates(0));
+        assert!(dnf_status_is_success(100));
+        assert!(dnf_status_has_updates(100));
+        assert!(!dnf_status_is_success(1));
+        assert!(!dnf_status_has_updates(1));
+        assert!(!dnf_status_is_success(200));
+        assert!(!dnf_status_has_updates(200));
+    }
+
+    #[test]
+    fn parses_dnf_update_package_names() {
+        let output =
+            "kernel.aarch64 6.12.4-1.fc42 updates\n\nvim-enhanced.aarch64 9.1.0-1.fc42 updates\n";
+
+        assert_eq!(
+            package_names_from_lines(output),
+            vec![
+                "kernel.aarch64".to_string(),
+                "vim-enhanced.aarch64".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_dnf_command_is_skipped_cleanly() {
+        let mut installed = false;
+        let mut logs = Vec::new();
+
+        let checked = ensure_check_target(
+            true,
+            &mut installed,
+            "__updt_test_missing_dnf_command__",
+            "dnf",
+            &mut logs,
+        )
+        .await;
+
+        assert!(!checked);
+        assert!(!installed);
+        assert!(logs.iter().any(|line| line.contains("未安装, 跳过.")));
     }
 
     #[test]

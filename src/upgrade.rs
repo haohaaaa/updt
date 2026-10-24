@@ -132,6 +132,10 @@ const RUSTUP_UPDATE_ARGS: &[&str] = &["update", "--no-self-update"];
 
 const PRE_PACMAN_STANDARD_TARGETS: &[StandardUpgradeTarget] = &[
     StandardUpgradeTarget {
+        id: "dnf",
+        run: run_dnf_target,
+    },
+    StandardUpgradeTarget {
         id: "brew",
         run: run_brew_target,
     },
@@ -253,6 +257,10 @@ fn run_paru_target<'a>(_state: &'a AppState, _self_pkg: &'a str) -> StandardUpgr
 
 fn run_flatpak_target<'a>(_state: &'a AppState, _self_pkg: &'a str) -> StandardUpgradeFuture<'a> {
     Box::pin(async { StandardUpgradeOutcome::from_success(upgrade_flatpak().await) })
+}
+
+fn run_dnf_target<'a>(state: &'a AppState, _self_pkg: &'a str) -> StandardUpgradeFuture<'a> {
+    Box::pin(async move { StandardUpgradeOutcome::from_success(upgrade_dnf(state).await) })
 }
 
 fn run_pkg_target<'a>(_state: &'a AppState, _self_pkg: &'a str) -> StandardUpgradeFuture<'a> {
@@ -404,6 +412,31 @@ async fn upgrade_flatpak() -> bool {
         "[flatpak] 应用升级失败.",
     )
     .await
+}
+
+async fn upgrade_dnf(state: &AppState) -> bool {
+    let (privilege_command, reason) = dnf_privilege_command(state).await;
+
+    if privilege_command == "pkexec" && !command_exists(privilege_command).await {
+        println!("[dnf] 未安装 pkexec, 无法使用 GUI 提权.");
+        println!("[dnf] 包升级失败.");
+        return false;
+    }
+    if let Some(reason) = reason {
+        println!("[dnf] {reason}");
+    }
+
+    println!("[dnf] 正在执行: {privilege_command} dnf upgrade");
+    match run_inherit(privilege_command, &["dnf", "upgrade"]).await {
+        Ok(true) => {
+            println!("[dnf] 包升级完成.");
+            true
+        }
+        _ => {
+            println!("[dnf] 包升级失败.");
+            false
+        }
+    }
 }
 
 async fn upgrade_pkg() -> bool {
@@ -1112,11 +1145,37 @@ fn print_pacman_upgrade_result(result: io::Result<bool>) -> bool {
 }
 
 async fn pacman_privilege_command(state: &AppState) -> (&'static str, Option<&'static str>) {
-    if !state.is_arch_linux || !desktop_linux_session() {
+    linux_package_privilege_command(state.is_arch_linux).await
+}
+
+async fn dnf_privilege_command(state: &AppState) -> (&'static str, Option<&'static str>) {
+    linux_package_privilege_command(state.is_asahi_linux).await
+}
+
+async fn linux_package_privilege_command(
+    profile_supports_desktop_auth: bool,
+) -> (&'static str, Option<&'static str>) {
+    if !profile_supports_desktop_auth || !desktop_linux_session() {
         return ("sudo", None);
     }
 
-    pacman_privilege_for_focus(terminal_focus_state().await)
+    linux_package_privilege_for_context(
+        profile_supports_desktop_auth,
+        true,
+        terminal_focus_state().await,
+    )
+}
+
+fn linux_package_privilege_for_context(
+    profile_supports_desktop_auth: bool,
+    desktop_session: bool,
+    focus: TerminalFocusState,
+) -> (&'static str, Option<&'static str>) {
+    if profile_supports_desktop_auth && desktop_session {
+        pacman_privilege_for_focus(focus)
+    } else {
+        ("sudo", None)
+    }
 }
 
 fn pacman_privilege_for_focus(state: TerminalFocusState) -> (&'static str, Option<&'static str>) {
@@ -1342,7 +1401,8 @@ exit"
 mod tests {
     use super::{
         RUSTUP_UPDATE_ARGS, ScoopInstallScope, ScoopUpdateTask, TerminalFocusState,
-        UpgradeFailures, build_scoop_update_tasks, paru_password_attention_reason,
+        UpgradeFailures, build_scoop_update_tasks, linux_package_privilege_for_context,
+        paru_password_attention_reason,
     };
     use crate::parse::ScoopExportApp;
 
@@ -1377,6 +1437,26 @@ mod tests {
         assert!(
             paru_password_attention_reason(TerminalFocusState::Unknown)
                 .is_some_and(|reason| reason.contains("无法确认"))
+        );
+    }
+
+    #[test]
+    fn linux_package_targets_use_sudo_or_pkexec_from_context() {
+        assert_eq!(
+            linux_package_privilege_for_context(true, true, TerminalFocusState::Focused),
+            ("sudo", None)
+        );
+        assert_eq!(
+            linux_package_privilege_for_context(true, true, TerminalFocusState::NotFocused),
+            ("pkexec", Some("terminal 未处于桌面焦点, 使用 GUI 提权."))
+        );
+        assert_eq!(
+            linux_package_privilege_for_context(true, false, TerminalFocusState::Unknown),
+            ("sudo", None)
+        );
+        assert_eq!(
+            linux_package_privilege_for_context(false, true, TerminalFocusState::NotFocused),
+            ("sudo", None)
         );
     }
 
