@@ -426,8 +426,8 @@ async fn upgrade_dnf(state: &AppState) -> bool {
         println!("[dnf] {reason}");
     }
 
-    println!("[dnf] 正在执行: {privilege_command} dnf upgrade");
-    match run_inherit(privilege_command, &["dnf", "upgrade"]).await {
+    println!("[dnf] 正在执行: {privilege_command} dnf upgrade --refresh");
+    match run_inherit(privilege_command, &["dnf", "upgrade", "--refresh"]).await {
         Ok(true) => {
             println!("[dnf] 包升级完成.");
             true
