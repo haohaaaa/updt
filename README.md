@@ -114,6 +114,7 @@ Target-specific notes:
 
 - `cargo` checks require `cargo-install-update` in `PATH`.
 - `cargo-binstall` is recommended for faster binary installation of cargo-managed tools, except on Android (Termux).
+- `dnf` checks require support for `dnf check-update --json` (DNF5).
 - `dnf` upgrades may use `sudo` or `pkexec`, depending on terminal focus and desktop session state.
 - Termux `pkg` checks use `apt list --upgradable`.
 - `pacman` upgrades may use `sudo` or `pkexec`, depending on terminal focus and desktop session state.

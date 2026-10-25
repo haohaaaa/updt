@@ -4,7 +4,7 @@ use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -111,8 +111,12 @@ async fn is_executable(path: &Path) -> bool {
     }
 }
 
+pub async fn run_output(program: &str, args: &[&str]) -> io::Result<Output> {
+    command(program).await.args(args).output().await
+}
+
 pub async fn run_capture(program: &str, args: &[&str]) -> io::Result<(i32, String)> {
-    let output = command(program).await.args(args).output().await?;
+    let output = run_output(program, args).await?;
     let code = output.status.code().unwrap_or(-1);
     let mut text = String::new();
     text.push_str(&String::from_utf8_lossy(&output.stdout));

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::fs;
 
-use crate::command::{command_exists, run_capture, run_cargo_install_update_capture};
+use crate::command::{command_exists, run_capture, run_cargo_install_update_capture, run_output};
 use crate::output::{MsgKind, log_pkg_line};
 use crate::parse::{
     ScoopExportApp, first_json_payload, first_token, parse_cargo_list, parse_scoop_export_output,
@@ -14,6 +14,7 @@ use crate::profile::parse_profile;
 use crate::state::{AppState, SystemProfile};
 
 const NPM_OUTDATED_ARGS: &[&str] = &["outdated", "--json", "--global", "--prefer-online"];
+const DNF_CHECK_ARGS: &[&str] = &["check-update", "--quiet", "--json"];
 
 pub struct CheckResult {
     pub target: String,
@@ -930,10 +931,10 @@ async fn check_dnf_quiet(state: &mut AppState, logs: &mut Vec<String>) {
 
     logs.push(log_pkg_line(
         "dnf",
-        "正在检查可升级项 (dnf check-update --quiet)...",
+        "正在检查可升级项 (dnf check-update --quiet --json)...",
         MsgKind::Info,
     ));
-    let (status, output) = match run_capture("dnf", &["check-update", "--quiet"]).await {
+    let output = match run_output("dnf", DNF_CHECK_ARGS).await {
         Ok(result) => result,
         Err(_) => {
             mark_check_failed(
@@ -946,43 +947,74 @@ async fn check_dnf_quiet(state: &mut AppState, logs: &mut Vec<String>) {
         }
     };
 
+    let status = output.status.code().unwrap_or(-1);
+    record_dnf_status(
+        state,
+        logs,
+        status,
+        &String::from_utf8_lossy(&output.stdout),
+    );
+    if state.dnf.check_failed {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            logs.push(log_pkg_line("dnf", stderr.trim(), MsgKind::Warn));
+        }
+    }
+}
+
+fn record_dnf_status(state: &mut AppState, logs: &mut Vec<String>, status: i32, output: &str) {
     if !dnf_status_is_success(status) {
         mark_check_failed(
             &mut state.dnf.check_failed,
             "dnf",
-            &format!("检查失败 (dnf check-update --quiet, exit {status})."),
+            &format!("检查失败 (dnf check-update --quiet --json, exit {status})."),
             logs,
         );
         return;
     }
 
-    state.dnf.updatable_items = if dnf_status_has_updates(status) {
-        package_names_from_lines(&output)
-    } else {
-        Vec::new()
+    let Some(items) = dnf_updatable_names(output) else {
+        mark_check_failed(
+            &mut state.dnf.check_failed,
+            "dnf",
+            "检查失败: JSON 解析失败.",
+            logs,
+        );
+        return;
     };
-    if dnf_status_has_updates(status) {
-        state.dnf.has_updates = true;
-        if state.dnf.updatable_items.is_empty() {
-            logs.push(log_pkg_line(
-                "dnf",
-                "DNF 报告有可升级项, 但未能解析包列表.",
-                MsgKind::Warn,
-            ));
-        } else {
-            log_item_list(logs, "dnf", "以下包可升级:", &state.dnf.updatable_items);
-        }
-    } else {
-        logs.push(log_pkg_line("dnf", "已是最新.", MsgKind::Ok));
-    }
+    // DNF5 can return 0 with available upgrades when JSON output is requested.
+    state.dnf.updatable_items = items;
+    record_bucket_items(
+        &mut state.dnf.has_updates,
+        logs,
+        "dnf",
+        &state.dnf.updatable_items,
+        "已是最新.",
+        "以下包可升级:",
+    );
 }
 
 fn dnf_status_is_success(status: i32) -> bool {
     status == 0 || status == 100
 }
 
-fn dnf_status_has_updates(status: i32) -> bool {
-    status == 100
+fn dnf_updatable_names(output: &str) -> Option<Vec<String>> {
+    let root = serde_json::from_str::<Value>(output).ok()?;
+    let mut items = Vec::new();
+    for section in root.as_object()?.values() {
+        for package in section.as_array()? {
+            let name = package.get("name")?.as_str()?;
+            let arch = package.get("arch")?.as_str()?;
+            if name.is_empty() || arch.is_empty() {
+                return None;
+            }
+            let item = format!("{name}.{arch}");
+            if !items.contains(&item) {
+                items.push(item);
+            }
+        }
+    }
+    Some(items)
 }
 
 async fn load_pacman_updates(use_checkupdates: bool) -> (i32, String) {
@@ -1125,9 +1157,9 @@ pub fn merge_check_result(state: &mut AppState, target: &str, local: AppState) {
 #[cfg(test)]
 mod tests {
     use super::{
-        dnf_status_has_updates, dnf_status_is_success, ensure_check_target,
+        dnf_status_is_success, dnf_updatable_names, ensure_check_target,
         is_identical_rustup_update, package_names_from_lines, pacman_status_means_no_updates,
-        pkg_updatable_name, pkg_updatable_names, record_rustup_status,
+        pkg_updatable_name, pkg_updatable_names, record_dnf_status, record_rustup_status,
         rustup_toolchains_include_windows_gnu,
     };
 
@@ -1217,27 +1249,108 @@ mod tests {
     #[test]
     fn recognizes_dnf_check_update_exit_codes() {
         assert!(dnf_status_is_success(0));
-        assert!(!dnf_status_has_updates(0));
         assert!(dnf_status_is_success(100));
-        assert!(dnf_status_has_updates(100));
         assert!(!dnf_status_is_success(1));
-        assert!(!dnf_status_has_updates(1));
         assert!(!dnf_status_is_success(200));
-        assert!(!dnf_status_has_updates(200));
     }
 
     #[test]
-    fn parses_dnf_update_package_names() {
-        let output =
-            "kernel.aarch64 6.12.4-1.fc42 updates\n\nvim-enhanced.aarch64 9.1.0-1.fc42 updates\n";
+    fn parses_dnf_json_package_names() {
+        let output = r#"{
+            "upgrades": [
+                {"name": "chatgpt", "arch": "aarch64", "evr": "26.1021.22027-1", "repository": "openai-chatgpt"},
+                {"name": "vim-enhanced", "arch": "aarch64"}
+            ]
+        }"#;
 
         assert_eq!(
-            package_names_from_lines(output),
-            vec![
-                "kernel.aarch64".to_string(),
-                "vim-enhanced.aarch64".to_string()
-            ]
+            dnf_updatable_names(output),
+            Some(vec![
+                "chatgpt.aarch64".into(),
+                "vim-enhanced.aarch64".into()
+            ])
         );
+    }
+
+    #[test]
+    fn dnf_json_sections_are_not_packages_and_duplicates_are_removed() {
+        let output = r#"{
+            "upgrades": [{"name": "kernel", "arch": "aarch64"}],
+            "obsoleting": [{"name": "kernel", "arch": "aarch64",
+                "obsoletes": [{"name": "old-kernel", "arch": "aarch64"}]}]
+        }"#;
+
+        assert_eq!(
+            dnf_updatable_names(output),
+            Some(vec!["kernel.aarch64".into()])
+        );
+    }
+
+    #[test]
+    fn dnf_json_reports_updates_even_with_exit_zero() {
+        use crate::state::AppState;
+        for status in [0, 100] {
+            let mut state = AppState::default();
+            let mut logs = Vec::new();
+            record_dnf_status(
+                &mut state,
+                &mut logs,
+                status,
+                r#"{"upgrades":[{"name":"chatgpt","arch":"aarch64"}]}"#,
+            );
+
+            assert!(state.dnf.has_updates);
+            assert!(!state.dnf.check_failed);
+            assert_eq!(state.dnf.updatable_items, vec!["chatgpt.aarch64"]);
+        }
+    }
+
+    #[test]
+    fn empty_dnf_json_means_no_updates() {
+        use crate::state::AppState;
+        for output in ["{}", r#"{"upgrades":[]}"#] {
+            let mut state = AppState::default();
+            let mut logs = Vec::new();
+            record_dnf_status(&mut state, &mut logs, 0, output);
+
+            assert!(!state.dnf.has_updates);
+            assert!(!state.dnf.check_failed);
+            assert!(state.dnf.updatable_items.is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_dnf_json_is_a_check_failure() {
+        use crate::state::AppState;
+        for output in [
+            "Upgrades\nchatgpt.aarch64 26.1021.22027-1 openai-chatgpt\n",
+            "{",
+            "[]",
+            r#"{"upgrades":{}}"#,
+            r#"{"upgrades":[{"name":"chatgpt"}]}"#,
+            r#"{"upgrades":[{"name":"","arch":"aarch64"}]}"#,
+        ] {
+            let mut state = AppState::default();
+            let mut logs = Vec::new();
+            record_dnf_status(&mut state, &mut logs, 0, output);
+
+            assert!(state.dnf.check_failed, "accepted invalid output: {output}");
+            assert!(!state.dnf.has_updates);
+            assert!(!logs.iter().any(|line| line.contains("已是最新")));
+        }
+    }
+
+    #[test]
+    fn dnf_command_errors_are_check_failures() {
+        use crate::state::AppState;
+        for status in [1, 200, -1] {
+            let mut state = AppState::default();
+            let mut logs = Vec::new();
+            record_dnf_status(&mut state, &mut logs, status, "{}");
+
+            assert!(state.dnf.check_failed);
+            assert!(!state.dnf.has_updates);
+        }
     }
 
     #[tokio::test]
