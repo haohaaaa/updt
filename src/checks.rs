@@ -1069,6 +1069,10 @@ async fn check_pkg_quiet(state: &mut AppState, logs: &mut Vec<String>) {
         return;
     }
 
+    if !refresh_pkg_metadata(&mut state.pkg.check_failed, logs).await {
+        return;
+    }
+
     logs.push(log_pkg_line(
         "pkg",
         "正在检查可升级项 (apt list --upgradable)...",
@@ -1086,6 +1090,35 @@ async fn check_pkg_quiet(state: &mut AppState, logs: &mut Vec<String>) {
         "已是最新.",
         "以下包可升级:",
     );
+}
+
+async fn refresh_pkg_metadata(check_failed: &mut bool, logs: &mut Vec<String>) -> bool {
+    logs.push(log_pkg_line(
+        "pkg",
+        "正在刷新软件源索引 (pkg update)...",
+        MsgKind::Info,
+    ));
+    match run_capture("pkg", &["update"]).await {
+        Ok((0, _)) => true,
+        Ok((status, _)) => {
+            mark_check_failed(
+                check_failed,
+                "pkg",
+                &format!("软件源索引刷新失败 (pkg update, exit {status})."),
+                logs,
+            );
+            false
+        }
+        Err(_) => {
+            mark_check_failed(
+                check_failed,
+                "pkg",
+                "软件源索引刷新失败: 无法执行 pkg update.",
+                logs,
+            );
+            false
+        }
+    }
 }
 
 async fn load_pkg_updates(check_failed: &mut bool, logs: &mut Vec<String>) -> Option<Vec<String>> {

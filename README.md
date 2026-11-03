@@ -117,7 +117,7 @@ Target-specific notes:
 - `dnf` checks require support for `dnf check-update --json` (DNF5).
 - `dnf` upgrades refresh repository metadata with `--refresh` so the elevated command sees current updates.
 - `dnf` upgrades may use `sudo` or `pkexec`, depending on terminal focus and desktop session state.
-- Termux `pkg` checks use `apt list --upgradable`.
+- Termux `pkg` checks refresh repository metadata with `pkg update` and inspect candidates with `apt list --upgradable`.
 - `pacman` upgrades may use `sudo` or `pkexec`, depending on terminal focus and desktop session state.
 
 ## Interactive Flow
