@@ -130,6 +130,10 @@ Running `updt` starts a three-stage workflow:
 
 The check stage runs in parallel across enabled targets. The upgrade stage runs the underlying package manager commands and forwards their output.
 
+On Windows, Scoop's `rustup` package update and cargo's `updt` self-update are deferred until all other updates finish. A single foreground window waits for the current `updt` process to exit, then updates Scoop's `rustup` package (preserving local/global scope), followed by `updt` itself. The main summary lists these as pending; their final results appear in the separate window. Rust toolchain updates (`rustup update --no-self-update`) still run during the normal upgrade stage.
+
+For other Scoop updates blocked by running processes, `Kill & Retry` stops processes running from the package's installation directory before retrying. If that includes the current `updt` process, it skips the package without stopping any processes and prints a command to run after `updt` exits. If stopping processes fails, the package is reported as failed without retrying. Deferred Scoop updates report any remaining process blockers in the final update window without stopping them automatically.
+
 Selector controls:
 
 | Key | Action |
