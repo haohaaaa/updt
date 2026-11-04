@@ -42,11 +42,9 @@ pub async fn upgrade_selected(state: &AppState, selected: &[String]) -> bool {
             .await;
     failures.merge(post_pacman_outcome.failures.clone());
     standard_outcome.merge(post_pacman_outcome);
-    if !upgrade_cargo_self_if_needed(self_pkg, standard_outcome.cargo_self_needs_update).await {
-        failures.record_label("cargo (updt 自身)");
-    }
+    let pending = finish_deferred_upgrades(self_pkg, &standard_outcome, &mut failures).await;
 
-    print_upgrade_summary(selected, &failures)
+    print_upgrade_summary(selected, &failures, &pending)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -175,6 +173,7 @@ struct StandardUpgradeOutcome {
     failed: bool,
     failures: UpgradeFailures,
     cargo_self_needs_update: bool,
+    deferred_scoop_tasks: Vec<ScoopUpdateTask>,
 }
 
 impl StandardUpgradeOutcome {
@@ -183,6 +182,7 @@ impl StandardUpgradeOutcome {
             failed: !success,
             failures: UpgradeFailures::default(),
             cargo_self_needs_update: false,
+            deferred_scoop_tasks: Vec::new(),
         }
     }
 
@@ -191,6 +191,7 @@ impl StandardUpgradeOutcome {
             failed: outcome.failed,
             failures: UpgradeFailures::default(),
             cargo_self_needs_update: outcome.self_needs_update,
+            deferred_scoop_tasks: Vec::new(),
         }
     }
 
@@ -198,6 +199,8 @@ impl StandardUpgradeOutcome {
         self.failed |= outcome.failed;
         self.failures.merge(outcome.failures);
         self.cargo_self_needs_update |= outcome.cargo_self_needs_update;
+        self.deferred_scoop_tasks
+            .extend(outcome.deferred_scoop_tasks);
     }
 }
 
@@ -246,9 +249,7 @@ fn run_rustup_target<'a>(_state: &'a AppState, _self_pkg: &'a str) -> StandardUp
 }
 
 fn run_scoop_target<'a>(state: &'a AppState, _self_pkg: &'a str) -> StandardUpgradeFuture<'a> {
-    Box::pin(
-        async move { StandardUpgradeOutcome::from_success(upgrade_scoop_packages(state).await) },
-    )
+    Box::pin(upgrade_scoop_packages(state))
 }
 
 fn run_paru_target<'a>(_state: &'a AppState, _self_pkg: &'a str) -> StandardUpgradeFuture<'a> {
@@ -267,11 +268,54 @@ fn run_pkg_target<'a>(_state: &'a AppState, _self_pkg: &'a str) -> StandardUpgra
     Box::pin(async { StandardUpgradeOutcome::from_success(upgrade_pkg().await) })
 }
 
-async fn upgrade_cargo_self_if_needed(self_pkg: &str, cargo_self_needs_update: bool) -> bool {
-    if cargo_self_needs_update {
-        upgrade_cargo_self(self_pkg).await
-    } else {
-        true
+async fn finish_deferred_upgrades(
+    self_pkg: &str,
+    outcome: &StandardUpgradeOutcome,
+    failures: &mut UpgradeFailures,
+) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let self_update = outcome.cargo_self_needs_update.then_some(self_pkg);
+        let mut labels = outcome
+            .deferred_scoop_tasks
+            .iter()
+            .map(|task| format!("scoop ({})", task.display_name()))
+            .collect::<Vec<_>>();
+        if self_update.is_some() {
+            labels.push("cargo (updt 自身)".to_string());
+        }
+        if labels.is_empty() {
+            return labels;
+        }
+        match schedule_windows_final_updates(&outcome.deferred_scoop_tasks, self_update).await {
+            Ok(()) => {
+                println!("[Windows] 已启动最终更新窗口, 将在当前 updt 退出后依次执行更新.");
+                labels
+            }
+            Err(err) => {
+                println!("[Windows] 启动最终更新窗口失败: {err}");
+                for label in labels {
+                    failures.record_label(&label);
+                }
+                for task in &outcome.deferred_scoop_tasks {
+                    println!(
+                        "[scoop] 可手动执行: {}",
+                        scoop_command_label(&task.update_args())
+                    );
+                }
+                if self_update.is_some() {
+                    println!("[cargo] 可手动执行: cargo install-update --locked {self_pkg}");
+                }
+                Vec::new()
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if outcome.cargo_self_needs_update && !upgrade_cargo_self(self_pkg).await {
+            failures.record_label("cargo (updt 自身)");
+        }
+        Vec::new()
     }
 }
 
@@ -462,24 +506,6 @@ async fn upgrade_pkg() -> bool {
     }
 }
 
-#[cfg(windows)]
-async fn upgrade_cargo_self(self_pkg: &str) -> bool {
-    println!(
-        "[cargo] 即将单独升级 updt: 先退出当前 updt, 再执行 cargo install-update --locked updt"
-    );
-    match schedule_windows_self_update(self_pkg).await {
-        Ok(()) => {
-            println!("[cargo] 已启动前台自更新窗口, 本次 updt 退出后会显示升级过程.");
-            true
-        }
-        Err(err) => {
-            println!("[cargo] 启动前台自更新窗口失败: {err}");
-            println!("[cargo] 可手动执行: cargo install-update --locked updt");
-            false
-        }
-    }
-}
-
 #[cfg(not(windows))]
 async fn upgrade_cargo_self(self_pkg: &str) -> bool {
     println!("[cargo] 正在执行: cargo install-update --locked updt");
@@ -516,7 +542,11 @@ async fn run_logged_inherit(
     }
 }
 
-fn print_upgrade_summary(selected: &[String], failures: &UpgradeFailures) -> bool {
+fn print_upgrade_summary(
+    selected: &[String],
+    failures: &UpgradeFailures,
+    pending: &[String],
+) -> bool {
     print_section("汇总");
     println!(
         "已选择升级项: {}",
@@ -526,6 +556,13 @@ fn print_upgrade_summary(selected: &[String], failures: &UpgradeFailures) -> boo
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if !pending.is_empty() {
+        println!("以下升级项已交接, 等待当前 updt 退出后执行:");
+        for label in pending {
+            println!("  - {label}");
+        }
+        println!("最终更新结果请查看独立窗口.");
+    }
     if !failures.is_empty() {
         println!("{}", err_text("存在升级失败项."));
         println!("失败升级项:");
@@ -534,7 +571,11 @@ fn print_upgrade_summary(selected: &[String], failures: &UpgradeFailures) -> boo
         }
         return false;
     }
-    println!("{}", ok_text("所有已选升级项执行完成."));
+    if pending.is_empty() {
+        println!("{}", ok_text("所有已选升级项执行完成."));
+    } else {
+        println!("{}", ok_text("当前进程内升级执行完成, 其余项目已交接."));
+    }
     true
 }
 
@@ -632,14 +673,16 @@ fn build_scoop_update_tasks(
     tasks
 }
 
-async fn upgrade_scoop_packages(state: &AppState) -> bool {
+async fn upgrade_scoop_packages(state: &AppState) -> StandardUpgradeOutcome {
     let Some(tasks) = scoop_update_tasks_for_state(state).await else {
-        return false;
+        return StandardUpgradeOutcome::from_success(false);
     };
 
     let outcome = run_scoop_update_batch(tasks, interactive_terminal()).await;
     outcome.print_summary();
-    outcome.success()
+    let mut result = StandardUpgradeOutcome::from_success(outcome.success());
+    result.deferred_scoop_tasks = outcome.deferred;
+    result
 }
 
 async fn scoop_update_tasks_for_state(state: &AppState) -> Option<Vec<ScoopUpdateTask>> {
@@ -670,6 +713,7 @@ struct ScoopBatchOutcome {
     skipped_in_use: Vec<String>,
     failed_other: Vec<String>,
     aborted: bool,
+    deferred: Vec<ScoopUpdateTask>,
 }
 
 impl ScoopBatchOutcome {
@@ -678,7 +722,10 @@ impl ScoopBatchOutcome {
             ScoopTaskOutcome::Updated => self.updated.push(task.display_name()),
             ScoopTaskOutcome::SkippedInUse => self.skipped_in_use.push(task.display_name()),
             ScoopTaskOutcome::FailedOther => self.failed_other.push(task.display_name()),
-            ScoopTaskOutcome::Aborted => self.aborted = true,
+            ScoopTaskOutcome::Aborted => {
+                self.aborted = true;
+                self.deferred.clear();
+            }
         }
     }
 
@@ -714,6 +761,14 @@ async fn run_scoop_update_batch(
 ) -> ScoopBatchOutcome {
     let mut batch = ScoopBatchOutcome::default();
     for task in tasks {
+        if cfg!(windows) && task.app.eq_ignore_ascii_case("rustup") {
+            println!(
+                "[scoop] {} 将放到最后, 在当前 updt 退出后由独立窗口更新.",
+                task.display_name()
+            );
+            batch.deferred.push(task);
+            continue;
+        }
         let outcome = run_scoop_update_task(&task, allow_prompt).await;
         batch.record(&task, outcome);
         if batch.aborted {
@@ -771,6 +826,7 @@ async fn run_scoop_update_attempt(task: &ScoopUpdateTask) -> Option<(i32, String
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ScoopBlockedUpdate {
     Retry,
     Done(ScoopTaskOutcome),
@@ -798,8 +854,21 @@ async fn retry_scoop_blocked_update(
     task: &ScoopUpdateTask,
     blocked: &ScoopBlockedProcessInfo,
 ) -> ScoopBlockedUpdate {
-    if let Err(err) = kill_scoop_task_processes(task, blocked).await {
+    scoop_retry_after_kill(task, kill_scoop_task_processes(task, blocked).await)
+}
+
+fn scoop_retry_after_kill(task: &ScoopUpdateTask, result: io::Result<()>) -> ScoopBlockedUpdate {
+    if let Err(err) = result {
+        if err.kind() == io::ErrorKind::WouldBlock {
+            println!("[scoop] {} 已跳过: {err}", task.display_name());
+            println!(
+                "[scoop] 请在 updt 退出后单独执行: {}",
+                scoop_command_label(&task.update_args())
+            );
+            return ScoopBlockedUpdate::Done(ScoopTaskOutcome::SkippedInUse);
+        }
         println!("[scoop] 结束 {} 关联进程失败: {err}", task.display_name());
+        return ScoopBlockedUpdate::Done(ScoopTaskOutcome::FailedOther);
     }
     println!("[scoop] 正在重试 {}...", task.display_name());
     ScoopBlockedUpdate::Retry
@@ -875,23 +944,7 @@ async fn kill_scoop_task_processes(
     } else {
         "powershell.exe"
     };
-    let app_dir_literal = ps_single_quote(&app_dir);
-    let script = format!(
-        "$ErrorActionPreference='Stop'; \
-$appDir = Convert-Path '{app_dir_literal}'; \
-$prefix = $appDir.TrimEnd('\\') + '\\'; \
-$targets = @(Get-Process | Where-Object {{ \
-    $_.Path -and \
-    ([System.IO.Path]::GetFullPath($_.Path)).StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) \
-}} | Sort-Object Id -Unique); \
-if ($targets.Count -eq 0) {{ \
-    Write-Output 'No matching processes found.'; \
-    exit 0; \
-}}; \
-$targets | ForEach-Object {{ Write-Output ('PID {{0}}: {{1}}' -f $_.Id, $_.Path) }}; \
-$targets | Stop-Process -Force -ErrorAction Stop; \
-Write-Output ('Stopped {{0}} process(es).' -f $targets.Count)"
-    );
+    let script = scoop_process_kill_script(&app_dir, process::id());
     let args = vec![
         shell.to_string(),
         "-NoLogo".to_string(),
@@ -903,10 +956,47 @@ Write-Output ('Stopped {{0}} process(es).' -f $targets.Count)"
 
     let (status, output) = run_capture("gsudo", &borrow_string_args(&args)).await?;
     print_captured_command_output(&output);
-    if status != 0 {
-        return Err(io::Error::other(format!("结束进程失败 (exit {status})")));
+    scoop_process_kill_result(status)
+}
+
+#[cfg(windows)]
+const SCOOP_SELF_BLOCKED_EXIT_CODE: i32 = 10;
+
+#[cfg(windows)]
+fn scoop_process_kill_result(status: i32) -> io::Result<()> {
+    match status {
+        0 => Ok(()),
+        SCOOP_SELF_BLOCKED_EXIT_CODE => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "当前 updt 正从该包安装目录运行, 不能结束自身进程以重试更新",
+        )),
+        _ => Err(io::Error::other(format!("结束进程失败 (exit {status})"))),
     }
-    Ok(())
+}
+
+#[cfg(windows)]
+fn scoop_process_kill_script(app_dir: &str, updt_pid: u32) -> String {
+    let app_dir_literal = ps_single_quote(app_dir);
+    format!(
+        "$ErrorActionPreference='Stop'; \
+$appDir = Convert-Path '{app_dir_literal}'; \
+$prefix = $appDir.TrimEnd('\\') + '\\'; \
+$targets = @(Get-Process | Where-Object {{ \
+    $_.Path -and \
+    ([System.IO.Path]::GetFullPath($_.Path)).StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) \
+}} | Sort-Object Id -Unique); \
+if ($targets.Id -contains {updt_pid}) {{ \
+    Write-Output 'Current updt process is blocking this update; no processes were stopped.'; \
+    exit {SCOOP_SELF_BLOCKED_EXIT_CODE}; \
+}}; \
+if ($targets.Count -eq 0) {{ \
+    Write-Output 'No matching processes found.'; \
+    exit 0; \
+}}; \
+$targets | ForEach-Object {{ Write-Output ('PID {{0}}: {{1}}' -f $_.Id, $_.Path) }}; \
+$targets | Stop-Process -Force -ErrorAction Stop; \
+Write-Output ('Stopped {{0}} process(es).' -f $targets.Count)"
+    )
 }
 
 #[cfg(not(windows))]
@@ -1339,72 +1429,475 @@ fn parent_pid_from_proc_stat(stat: &str) -> Option<u32> {
 }
 
 #[cfg(windows)]
-async fn schedule_windows_self_update(pkg: &str) -> io::Result<()> {
-    let parent_pid = process::id();
-    let script = format!(
-        "$ErrorActionPreference='Continue'; \
-$parentPid={parent_pid}; \
-while (Get-Process -Id $parentPid -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 200 }}; \
-cargo install-update --locked {pkg}; \
-Write-Host ''; \
-Write-Host 'Self-update finished. Press Enter to close this window.'; \
-[void](Read-Host); \
-exit"
-    );
-
+async fn schedule_windows_final_updates(
+    scoop_tasks: &[ScoopUpdateTask],
+    self_pkg: Option<&str>,
+) -> io::Result<()> {
+    if !scoop_tasks.is_empty() && !command_exists("gsudo").await {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Windows Scoop 更新需要 gsudo, 但未找到 gsudo",
+        ));
+    }
     let shell = if command_exists("pwsh").await {
         "pwsh"
     } else {
         "powershell.exe"
     };
-
-    let primary = tokio::task::block_in_place(|| {
-        Command::new("cmd.exe")
-            .arg("/C")
-            .arg("start")
-            .arg("")
-            .arg(shell)
-            .arg("-NoLogo")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg(&script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map(|_| ())
-    });
-
-    if primary.is_ok() {
-        return Ok(());
+    let script = windows_final_update_script(process::id(), scoop_tasks, self_pkg);
+    let launcher = windows_final_update_launcher(shell, &script);
+    let (status, output) = run_capture(
+        shell,
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &launcher,
+        ],
+    )
+    .await?;
+    if status != 0 {
+        return Err(io::Error::other(format!(
+            "启动更新窗口失败 (exit {status}): {}",
+            output.trim()
+        )));
     }
+    Ok(())
+}
 
-    tokio::task::block_in_place(|| {
-        Command::new("cmd.exe")
-            .arg("/C")
-            .arg("start")
-            .arg("")
-            .arg("powershell.exe")
-            .arg("-NoLogo")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg(&script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map(|_| ())
-    })
+#[cfg(windows)]
+fn windows_final_update_script(
+    parent_pid: u32,
+    scoop_tasks: &[ScoopUpdateTask],
+    self_pkg: Option<&str>,
+) -> String {
+    let mut script = format!(
+        r#"$ErrorActionPreference='Stop'
+Write-Host 'Waiting for updt to exit before running final updates...'
+Wait-Process -Id {parent_pid} -ErrorAction SilentlyContinue
+Set-Location -LiteralPath ([System.IO.Path]::GetTempPath())
+$script:failedUpdates = [System.Collections.Generic.List[string]]::new()
+function Invoke-UpdtFinalUpdate {{
+    param([string] $Label, [scriptblock] $Command, [switch] $Scoop)
+    try {{
+        Write-Host ('Updating ' + $Label + '...')
+        $global:LASTEXITCODE = 0
+        & $Command | Tee-Object -Variable commandOutput | Out-Host
+        if ($LASTEXITCODE -ne 0) {{
+            throw ('Command exited with code ' + $LASTEXITCODE)
+        }}
+        $text = $commandOutput -join [Environment]::NewLine
+        if ($Scoop -and ($text.Contains('Running process detected, skip updating.') -or
+            $text.Contains('are still running. Close them and try again.'))) {{
+            throw 'Package is still blocked by running processes. Close them and retry manually.'
+        }}
+        Write-Host ('[OK] ' + $Label)
+    }} catch {{
+        $script:failedUpdates.Add($Label)
+        Write-Host ('[FAILED] ' + $Label + ': ' + $_.Exception.Message)
+    }}
+}}
+"#
+    );
+    for task in scoop_tasks {
+        let args = task
+            .update_args()
+            .iter()
+            .map(|arg| format!("'{}'", ps_single_quote(arg)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let label = ps_single_quote(&format!("scoop ({})", task.display_name()));
+        script.push_str(&format!(
+            "Invoke-UpdtFinalUpdate -Label '{label}' -Scoop -Command {{ & 'gsudo' 'scoop' {args} }}\n"
+        ));
+    }
+    if let Some(pkg) = self_pkg {
+        script.push_str(&format!(
+            "Invoke-UpdtFinalUpdate -Label 'cargo (updt self-update)' -Command {{ & 'cargo' 'install-update' '--locked' '{}' }}\n",
+            ps_single_quote(pkg)
+        ));
+    }
+    script.push_str(
+        r#"Write-Host ''
+$exitCode = 0
+if ($script:failedUpdates.Count -gt 0) {
+    Write-Host ('Failed updates: ' + ($script:failedUpdates -join ', '))
+    $exitCode = 1
+} else {
+    Write-Host 'All final updates completed.'
+}
+[void](Read-Host 'Press Enter to close this window')
+exit $exitCode
+"#,
+    );
+    script
+}
+
+#[cfg(windows)]
+fn windows_final_update_launcher(shell: &str, script: &str) -> String {
+    let shell = ps_single_quote(shell);
+    let script = ps_single_quote(script);
+    format!(
+        "$ErrorActionPreference='Stop'; \
+$script = '{script}'; \
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script)); \
+Start-Process -FilePath '{shell}' \
+    -ArgumentList @('-NoLogo', '-NoProfile', '-EncodedCommand', $encoded) \
+    -WorkingDirectory ([System.IO.Path]::GetTempPath()) -WindowStyle Normal -ErrorAction Stop"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        RUSTUP_UPDATE_ARGS, ScoopInstallScope, ScoopUpdateTask, TerminalFocusState,
-        UpgradeFailures, build_scoop_update_tasks, linux_package_privilege_for_context,
-        paru_password_attention_reason,
+        RUSTUP_UPDATE_ARGS, ScoopBlockedUpdate, ScoopInstallScope, ScoopTaskOutcome,
+        ScoopUpdateTask, TerminalFocusState, UpgradeFailures, build_scoop_update_tasks,
+        linux_package_privilege_for_context, paru_password_attention_reason,
+        scoop_retry_after_kill,
     };
     use crate::parse::ScoopExportApp;
+
+    #[test]
+    fn merging_upgrade_outcomes_keeps_all_deferred_tasks() {
+        let mut outcome = super::StandardUpgradeOutcome::from_cargo(super::CargoUpgradeOutcome {
+            failed: false,
+            self_needs_update: true,
+        });
+        let tasks = vec![ScoopUpdateTask {
+            app: "rustup".to_string(),
+            scope: ScoopInstallScope::Global,
+        }];
+        let mut scoop_outcome = super::StandardUpgradeOutcome::from_success(false);
+        scoop_outcome.deferred_scoop_tasks = tasks.clone();
+        outcome.merge(scoop_outcome);
+        outcome.merge(super::StandardUpgradeOutcome::default());
+
+        assert!(outcome.failed);
+        assert!(outcome.cargo_self_needs_update);
+        assert_eq!(outcome.deferred_scoop_tasks, tasks);
+    }
+
+    #[test]
+    fn aborting_scoop_cancels_deferred_scoop_updates() {
+        let task = ScoopUpdateTask {
+            app: "rustup".to_string(),
+            scope: ScoopInstallScope::Local,
+        };
+        let mut outcome = super::ScoopBatchOutcome::default();
+        outcome.deferred.push(task.clone());
+        outcome.record(&task, ScoopTaskOutcome::Aborted);
+
+        assert!(outcome.aborted);
+        assert!(!outcome.success());
+        assert!(outcome.deferred.is_empty());
+    }
+
+    #[cfg(windows)]
+    mod windows_final_updates {
+        use super::super::{
+            ScoopInstallScope, ScoopUpdateTask, run_scoop_update_batch,
+            windows_final_update_launcher, windows_final_update_script,
+        };
+        use std::process::{Command, Output};
+
+        // Only the script runs: package managers, waiting, input and window creation
+        // are mocked, so tests never update packages or open windows.
+        fn run_script(script: &str, overrides: &str) -> Output {
+            let script = format!(
+                r#"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+function Wait-Process {{
+    [CmdletBinding()]
+    param([int] $Id)
+    Write-Host ('WAIT:' + $Id)
+}}
+function gsudo {{
+    Write-Output ('SCOOP:' + ($args -join '|'))
+    $global:LASTEXITCODE = 0
+}}
+function cargo {{
+    Write-Output ('CARGO:' + ($args -join '|'))
+    $global:LASTEXITCODE = 0
+}}
+function Read-Host {{}}
+{overrides}
+{script}"#
+            );
+            Command::new("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &script,
+                ])
+                .output()
+                .unwrap()
+        }
+
+        fn rustup_tasks() -> Vec<ScoopUpdateTask> {
+            vec![
+                ScoopUpdateTask {
+                    app: "rustup".to_string(),
+                    scope: ScoopInstallScope::Local,
+                },
+                ScoopUpdateTask {
+                    app: "rustup".to_string(),
+                    scope: ScoopInstallScope::Global,
+                },
+            ]
+        }
+
+        #[tokio::test]
+        async fn defers_both_rustup_scopes_without_running_scoop() {
+            let tasks = rustup_tasks();
+            let outcome = run_scoop_update_batch(tasks.clone(), false).await;
+
+            assert!(outcome.success());
+            assert_eq!(outcome.deferred, tasks);
+            assert!(outcome.updated.is_empty());
+            assert!(outcome.skipped_in_use.is_empty());
+        }
+
+        #[test]
+        fn waits_then_updates_rustup_scopes_before_updt() {
+            let script = windows_final_update_script(123, &rustup_tasks(), Some("updt"));
+            let output = run_script(&script, "");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            assert!(output.status.success(), "{output:?}");
+            let wait = stdout.find("WAIT:123").unwrap();
+            let local = stdout.find("SCOOP:scoop|update|rustup").unwrap();
+            let global = stdout.find("SCOOP:scoop|update|rustup|--global").unwrap();
+            let cargo = stdout.find("CARGO:install-update|--locked|updt").unwrap();
+            assert!(wait < local && local < global && global < cargo, "{stdout}");
+            assert!(stdout.contains("All final updates completed."));
+        }
+
+        #[test]
+        fn schedules_only_requested_final_updates() {
+            let scoop_only =
+                run_script(&windows_final_update_script(123, &rustup_tasks(), None), "");
+            let scoop_stdout = String::from_utf8_lossy(&scoop_only.stdout);
+            assert!(scoop_only.status.success(), "{scoop_only:?}");
+            assert!(scoop_stdout.contains("SCOOP:"));
+            assert!(!scoop_stdout.contains("CARGO:"));
+
+            let self_only = run_script(&windows_final_update_script(123, &[], Some("updt")), "");
+            let self_stdout = String::from_utf8_lossy(&self_only.stdout);
+            assert!(self_only.status.success(), "{self_only:?}");
+            assert!(self_stdout.contains("CARGO:"));
+            assert!(!self_stdout.contains("SCOOP:"));
+        }
+
+        #[test]
+        fn reports_failed_rustup_and_still_attempts_updt() {
+            let script = windows_final_update_script(123, &rustup_tasks()[..1], Some("updt"));
+            let output = run_script(&script, "function gsudo { $global:LASTEXITCODE = 7 }");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(stdout.contains("[FAILED] scoop (rustup)"));
+            assert!(stdout.contains("CARGO:install-update|--locked|updt"));
+            assert!(stdout.contains("[OK] cargo (updt self-update)"));
+            assert!(!stdout.contains("All final updates completed."));
+        }
+
+        #[test]
+        fn reports_process_blockers_even_if_scoop_exits_successfully() {
+            let script = windows_final_update_script(123, &rustup_tasks()[..1], None);
+            let output = run_script(
+                &script,
+                "function gsudo { Write-Output 'Running process detected, skip updating.'; $global:LASTEXITCODE = 0 }",
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(stdout.contains("[FAILED] scoop (rustup)"));
+            assert!(!stdout.contains("[OK] scoop (rustup)"));
+        }
+
+        #[test]
+        fn successful_native_stderr_does_not_fail_self_update() {
+            let script = windows_final_update_script(123, &[], Some("updt"));
+            let output = run_script(
+                &script,
+                r#"function cargo {
+    & "$PSHOME\powershell.exe" -NoLogo -NoProfile -NonInteractive -Command "[Console]::Error.WriteLine('native progress output'); exit 0"
+}"#,
+            );
+
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("[OK] cargo (updt self-update)")
+            );
+        }
+
+        #[test]
+        fn launcher_preserves_script_quotes_and_unicode_without_running_it() {
+            let script = "Write-Output 'quoted 测试';\nthrow 'must not execute in launcher'";
+            let shell = r"C:\Program Files\PowerShell\7\pwsh.exe";
+            let output = run_script(
+                &windows_final_update_launcher(shell, script),
+                r#"function Start-Process {
+    [CmdletBinding()]
+    param([string] $FilePath, [string[]] $ArgumentList, [string] $WorkingDirectory, [string] $WindowStyle)
+    [pscustomobject]@{
+        shell=$FilePath
+        script=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($ArgumentList[-1]))
+        mode=$ArgumentList[-2]
+        style=$WindowStyle
+        directory=$WorkingDirectory
+    } | ConvertTo-Json -Compress
+}"#,
+            );
+            assert!(output.status.success(), "{output:?}");
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["shell"], shell);
+            assert_eq!(result["script"], script);
+            assert_eq!(result["mode"], "-EncodedCommand");
+            assert_eq!(result["style"], "Normal");
+            assert!(!result["directory"].as_str().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn retries_scoop_only_after_processes_are_stopped() {
+        let task = ScoopUpdateTask {
+            app: "rustup".to_string(),
+            scope: ScoopInstallScope::Local,
+        };
+
+        assert_eq!(
+            scoop_retry_after_kill(&task, Ok(())),
+            ScoopBlockedUpdate::Retry
+        );
+        assert_eq!(
+            scoop_retry_after_kill(
+                &task,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "access denied",
+                )),
+            ),
+            ScoopBlockedUpdate::Done(ScoopTaskOutcome::FailedOther)
+        );
+        assert_eq!(
+            scoop_retry_after_kill(
+                &task,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "current updt process is in use",
+                )),
+            ),
+            ScoopBlockedUpdate::Done(ScoopTaskOutcome::SkippedInUse)
+        );
+    }
+
+    #[cfg(windows)]
+    mod scoop_process_recovery {
+        use super::super::{
+            SCOOP_SELF_BLOCKED_EXIT_CODE, ps_single_quote, scoop_process_kill_result,
+            scoop_process_kill_script,
+        };
+        use std::path::PathBuf;
+        use std::process::{Command, Output};
+
+        // Run the production script with fake process enumeration and termination.
+        // These tests never stop real processes or invoke Scoop/gsudo.
+        fn run_script(processes: &[(u32, PathBuf)]) -> Output {
+            let app_dir = std::env::current_dir().unwrap();
+            let fixtures = processes
+                .iter()
+                .map(|(id, path)| {
+                    format!(
+                        "[pscustomobject]@{{Id={id};Path='{}'}};",
+                        ps_single_quote(path.to_str().unwrap())
+                    )
+                })
+                .collect::<String>();
+            let script = format!(
+                "function Get-Process {{ {fixtures} }}
+function Stop-Process {{
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline=$true)] $InputObject, [switch] $Force)
+    process {{ Write-Output ('STOPPED:' + $InputObject.Id) }}
+}}
+{}",
+                scoop_process_kill_script(app_dir.to_str().unwrap(), 101)
+            );
+            Command::new("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &script,
+                ])
+                .output()
+                .unwrap()
+        }
+
+        #[test]
+        fn skips_self_blocked_package_before_stopping_any_process() {
+            let app_dir = std::env::current_dir().unwrap();
+            let output = run_script(&[
+                (202, app_dir.join("rustup.exe")),
+                (101, app_dir.join(".cargo/bin/updt.exe")),
+            ]);
+
+            assert_eq!(output.status.code(), Some(SCOOP_SELF_BLOCKED_EXIT_CODE));
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("STOPPED:"));
+            assert_eq!(
+                scoop_process_kill_result(output.status.code().unwrap())
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+
+        #[test]
+        fn stops_only_package_processes_when_updt_is_outside_package() {
+            let app_dir = std::env::current_dir().unwrap();
+            let outside_dir = app_dir.with_file_name(format!(
+                "{}-other",
+                app_dir.file_name().unwrap().to_str().unwrap()
+            ));
+            let output = run_script(&[
+                (101, outside_dir.join("updt.exe")),
+                (202, app_dir.join("rustup.exe")),
+                // Windows package paths must match regardless of letter case.
+                (
+                    203,
+                    PathBuf::from(app_dir.join("cargo.exe").to_str().unwrap().to_uppercase()),
+                ),
+                (204, outside_dir.join("other.exe")),
+            ]);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            assert!(output.status.success(), "{output:?}");
+            assert!(stdout.contains("STOPPED:202"));
+            assert!(stdout.contains("STOPPED:203"));
+            assert!(!stdout.contains("STOPPED:101"));
+            assert!(!stdout.contains("STOPPED:204"));
+            assert!(scoop_process_kill_result(output.status.code().unwrap()).is_ok());
+        }
+
+        #[test]
+        fn retries_without_stopping_anything_when_blockers_have_exited() {
+            let output = run_script(&[]);
+
+            assert!(output.status.success(), "{output:?}");
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("STOPPED:"));
+            assert!(scoop_process_kill_result(output.status.code().unwrap()).is_ok());
+        }
+
+        #[test]
+        fn treats_failed_kill_command_as_error() {
+            assert!(scoop_process_kill_result(1).is_err());
+            assert!(scoop_process_kill_result(-1).is_err());
+        }
+    }
 
     #[test]
     fn records_failure_labels_once() {
