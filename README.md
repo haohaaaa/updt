@@ -162,9 +162,9 @@ The workflow submits commands through an internal Rust execution API. The UI ope
 
 The sidebar lists command sessions; `F5` / `F6` switches between them and the workflow view. Up to 32 completed/running sessions are retained (older completed sessions are evicted first). Each session has its own terminal screen and scrollback. The header shows the selected command and its exit status. Workflow messages remain in the **activity view** (`F2`, up to 500 lines). See [the internal execution API](docs/terminal-execution.md) for implementation details.
 
-On Windows, deferred `rustup` and `updt` updates wait for the **outer terminal interface** to exit, so its executable no longer holds the installation directory open. Once the workflow finishes, press Enter or Esc to close the interface and allow those updates to run.
+On Windows, deferred `rustup` and `updt` updates wait for the **outer terminal interface** to exit, so its executable no longer holds the installation directory open. Once the workflow finishes, press Esc to leave panel focus, then `q` to close the interface and allow those updates to run.
 
-The new interface uses a native PTY (ConPTY on Windows), with ANSI colors, Unicode, terminal resizing, keyboard input, paste, and up to 2,000 lines of scrollback. The standalone validation modes remain available:
+The new interface uses a native PTY (ConPTY on Windows), with ANSI colors, Unicode, terminal resizing, keyboard and mouse input, paste, and up to 2,000 lines of scrollback. The standalone validation modes remain available:
 
 ```bash
 updt terminal --demo
@@ -173,15 +173,18 @@ updt terminal --shell
 
 `--demo` runs two harmless commands through the execution API: one produces JSON and stderr, and one asks for text input in a real PTY. The demo verifies the captured JSON and shows the interactive command's returned exit code and output size. It does not execute package-manager commands. `--shell` opens PowerShell on Windows or `$SHELL` (falling back to `/bin/sh`) on Unix without starting the update workflow. Commands you type run in that shell.
 
-- Type directly in the terminal; `Ctrl+C` is forwarded to the child terminal.
+- Start in panel navigation mode. Use `h/j/k/l` or the arrow keys to move between the target list, session list, and terminal output; press Enter to focus the selected panel. A cyan border marks the selected panel; green means focused.
+- Within a focused list, use `h/j/k/l` or the arrow keys to move between entries. Moving through sessions displays each session's output. Within the focused terminal, keys (including `q`, `h/j/k/l`, arrows, and `Ctrl+C`) go to the child process.
+- Esc always leaves panel focus and never exits the interface or reaches the child process. Press `q` in navigation mode to exit; a running workflow requires confirmation. Enter does not close a finished terminal.
+- Click a target or session to select it and focus its panel; click terminal output to focus it. The footer buttons are clickable too.
+- Scroll over terminal output or activity history to review it. Scroll over the sidebar lists to browse their entries. When a focused live child requests mouse reporting, clicks, releases, dragging, motion, and wheel events are forwarded using its requested mode and pane-relative coordinates. Hold Shift while scrolling to review local history instead.
 - Use `F2` to switch between terminal output and the read-only activity view in the update workflow.
 - Use `F5` / `F6` to switch to the previous/next command session or workflow view. Manually selecting a session stops automatic focus changes.
 - Use `Shift+PageUp` / `Shift+PageDown` to review output or activity history.
 - Use `F4` to return to the active interactive command (or workflow when none is running) and resume automatic focus. Query sessions and completed commands are read-only. Keyboard input and paste are paused while browsing history, so they cannot accidentally answer a hidden prompt.
-- Use `exit` to end the shell, then `Enter` or `Esc` to return.
-- `F10` asks for confirmation before ending a running terminal; it closes a finished terminal immediately.
+- Use `exit` to end the shell, then Esc to leave focus and `q` to return.
 
-Command sessions run separate processes; working-directory changes and shell variables do not persist between commands. Use `--shell` for a persistent interactive shell. Mouse forwarding and full compatibility with arbitrary terminal applications are not yet validated.
+Command sessions run separate processes; working-directory changes and shell variables do not persist between commands. Use `--shell` for a persistent interactive shell. Mouse capture is restored on exit. Full compatibility with arbitrary terminal applications is not guaranteed.
 
 Show the installed version:
 

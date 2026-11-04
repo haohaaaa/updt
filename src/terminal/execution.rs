@@ -131,7 +131,7 @@ pub async fn run_demo() -> io::Result<()> {
     if result.code != 0 {
         return Err(io::Error::other("交互命令没有正常完成"));
     }
-    println!("演示完成。F5/F6 可回看两条命令，Enter 退出。");
+    println!("演示完成。F5/F6 可回看两条命令，Esc 退焦后 q 退出。");
     Ok(())
 }
 

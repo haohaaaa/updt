@@ -1,14 +1,17 @@
 //! Opt-in PTY UI. The legacy interface stays independent of this entry point.
 pub mod business;
 pub mod execution;
+mod mouse;
+mod navigation;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use navigation::Panel;
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use ratatui::{
     Terminal,
@@ -188,8 +191,18 @@ struct TerminalMode;
 impl TerminalMode {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(err) = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste) {
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        if let Err(err) = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        ) {
+            let _ = execute!(
+                io::stdout(),
+                DisableMouseCapture,
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            );
             let _ = disable_raw_mode();
             return Err(err);
         }
@@ -198,7 +211,12 @@ impl TerminalMode {
 }
 impl Drop for TerminalMode {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -231,6 +249,32 @@ fn content_regions(pane: Rect, workflow: bool) -> (Rect, Rect) {
     let parts =
         Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).split(pane);
     (parts[0], parts[1])
+}
+
+fn sidebar_regions(sidebar: Rect, workflow: bool) -> (Rect, Rect, Rect) {
+    let parts = Layout::vertical([Constraint::Length(7), Constraint::Min(1)]).split(sidebar);
+    let session_height = if workflow && parts[1].height >= 6 {
+        6.min(parts[1].height - 3)
+    } else {
+        0
+    };
+    let lists =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(session_height)]).split(parts[1]);
+    (parts[0], lists[0], lists[1])
+}
+
+fn session_list_offset(view: &View, area: Rect) -> usize {
+    view.session_offset.min(
+        view.session_list
+            .len()
+            .saturating_sub(usize::from(Block::bordered().inner(area).height)),
+    )
+}
+
+fn target_list_offset(view: &View, area: Rect) -> usize {
+    view.selected_target
+        .saturating_add(1)
+        .saturating_sub(usize::from(Block::bordered().inner(area).height))
 }
 
 fn pty_size(area: Rect, workflow: bool) -> PtySize {
@@ -362,31 +406,55 @@ fn run_session(
             }
         }
         let active = sessions.as_ref().and_then(execution::Sessions::active);
+        view.target_count = parser
+            .callbacks()
+            .progress
+            .as_ref()
+            .map_or(4, |p| p.targets.len());
+        let (sidebar, _, _) = regions(terminal.get_frame().area());
+        if (sidebar.width == 0 && view.panel != Panel::Output)
+            || (view.panel == Panel::Sessions
+                && (!workflow || sidebar_regions(sidebar, workflow).2.height <= 2))
+        {
+            view.panel = Panel::Output;
+            view.focused = false;
+        }
         view.session = active.map(|pane| SessionView {
             label: format!("#{} {}", pane.id, pane.label),
             code: pane.code,
             interactive: pane.accepts_input(),
         });
         if let Some(sessions) = &sessions {
-            view.session_list = std::iter::once("流程 · 确认与汇总".to_string())
+            view.session_list = std::iter::once(Line::from("流程 · 确认与汇总"))
                 .chain(sessions.panes.iter().map(|pane| {
-                    format!(
-                        "#{} {} {}",
-                        pane.id,
-                        if pane.code.is_some() {
-                            "完成"
-                        } else {
-                            "运行"
-                        },
-                        pane.label
-                    )
+                    let (status, color) = match pane.code {
+                        None => ("运行", Color::Cyan),
+                        Some(0) => ("完成", Color::Green),
+                        Some(_) => ("完成", Color::Red),
+                    };
+                    Line::from(vec![
+                        Span::raw(format!("#{} ", pane.id)),
+                        Span::styled(status, Style::default().fg(color)),
+                        Span::raw(format!(" {}", pane.label)),
+                    ])
                 }))
                 .collect();
-            view.selected_session = sessions
+            let selected = sessions
                 .panes
                 .iter()
                 .position(|pane| Some(pane.id) == sessions.active)
                 .map_or(0, |i| i + 1);
+            if selected != view.selected_session {
+                let (sidebar, _, _) = regions(terminal.get_frame().area());
+                let (_, _, list) = sidebar_regions(sidebar, workflow);
+                let rows = usize::from(Block::bordered().inner(list).height).max(1);
+                if selected < view.session_offset {
+                    view.session_offset = selected;
+                } else if selected >= view.session_offset + rows {
+                    view.session_offset = selected + 1 - rows;
+                }
+            }
+            view.selected_session = selected;
         }
         let current_view = (
             sessions.as_ref().and_then(|sessions| sessions.active),
@@ -414,7 +482,85 @@ fn run_session(
         if !event::poll(Duration::from_millis(30))? {
             continue;
         }
-        match event::read()? {
+        let input = event::read()?;
+        let input = if let Event::Mouse(event) = input {
+            match mouse::action(
+                event,
+                terminal.get_frame().area(),
+                active_screen(&parser, &sessions),
+                &view,
+                workflow,
+                confirm_exit,
+                exit_code.is_none(),
+            ) {
+                Some(mouse::Action::Key(code)) => {
+                    if code == KeyCode::Char('q') {
+                        view.focused = false;
+                    }
+                    Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+                }
+                Some(mouse::Action::SelectSession(index)) => {
+                    if let Some(sessions) = &mut sessions {
+                        sessions.active = index.checked_sub(1).map(|i| sessions.panes[i].id);
+                        view.history = false;
+                        view.follow = false;
+                        view.panel = Panel::Sessions;
+                        view.focused = true;
+                    }
+                    continue;
+                }
+                Some(mouse::Action::SelectTarget(index)) => {
+                    view.selected_target = index;
+                    view.panel = Panel::Targets;
+                    view.focused = true;
+                    continue;
+                }
+                Some(mouse::Action::Focus(panel)) => {
+                    view.panel = panel;
+                    view.focused = true;
+                    continue;
+                }
+                Some(mouse::Action::ScrollOutput(up)) => {
+                    scroll_output(&mut parser, &mut sessions, &mut view, size, up, 3);
+                    continue;
+                }
+                Some(mouse::Action::ScrollSessions(up)) => {
+                    view.panel = Panel::Sessions;
+                    view.focused = true;
+                    view.follow = false;
+                    view.session_offset = if up {
+                        view.session_offset.saturating_sub(3)
+                    } else {
+                        view.session_offset.saturating_add(3)
+                    };
+                    let (sidebar, _, _) = regions(terminal.get_frame().area());
+                    view.session_offset =
+                        session_list_offset(&view, sidebar_regions(sidebar, workflow).2);
+                    continue;
+                }
+                Some(mouse::Action::ScrollTargets(up)) => {
+                    view.panel = Panel::Targets;
+                    view.focused = true;
+                    view.selected_target = if up {
+                        view.selected_target.saturating_sub(1)
+                    } else {
+                        view.selected_target.saturating_add(1)
+                    }
+                    .min(view.target_count.saturating_sub(1));
+                    continue;
+                }
+                Some(mouse::Action::Forward(bytes)) => {
+                    view.panel = Panel::Output;
+                    view.focused = true;
+                    write_active(&mut session, &mut sessions, &bytes)?;
+                    continue;
+                }
+                None => continue,
+            }
+        } else {
+            input
+        };
+        match input {
             Event::Resize(width, height) => {
                 size = pty_size(Rect::new(0, 0, width, height), workflow);
                 session.resize(size)?;
@@ -425,6 +571,8 @@ fn run_session(
             }
             Event::Paste(text)
                 if exit_code.is_none()
+                    && view.focused
+                    && view.panel == Panel::Output
                     && !confirm_exit
                     && !view.history
                     && active_screen(&parser, &sessions).scrollback() == 0 =>
@@ -438,15 +586,19 @@ fn run_session(
                 write_active(&mut session, &mut sessions, &bytes)?;
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if confirm_exit {
+                if key.code == KeyCode::Esc {
+                    confirm_exit = false;
+                    view.focused = false;
+                } else if confirm_exit {
                     match key.code {
                         KeyCode::Char('y' | 'Y') => return Ok(130),
-                        KeyCode::Esc | KeyCode::Char('n' | 'N') => confirm_exit = false,
+                        KeyCode::Char('n' | 'N') => confirm_exit = false,
                         _ => {}
                     }
                 } else if workflow && key.code == KeyCode::F(2) {
                     view.history = !view.history;
                     view.follow = !view.history;
+                    view.panel = Panel::Output;
                 } else if workflow && matches!(key.code, KeyCode::F(5) | KeyCode::F(6)) {
                     view.history = false;
                     view.follow = false;
@@ -455,6 +607,7 @@ fn run_session(
                     }
                 } else if key.code == KeyCode::F(4) {
                     view = View::default();
+                    view.focused = true;
                     if let Some(sessions) = &mut sessions {
                         sessions.live();
                         if let Some(pane) = sessions.active_mut() {
@@ -462,50 +615,53 @@ fn run_session(
                         }
                     }
                     parser.screen_mut().set_scrollback(0);
-                } else if view.history && key.code == KeyCode::Esc {
-                    view.history = false;
-                } else if key.code == KeyCode::F(10) {
-                    if let Some(code) = exit_code {
-                        return Ok(code);
+                } else if let Some(action) =
+                    navigation::handle(key, &mut view, terminal.get_frame().area(), workflow)
+                {
+                    match action {
+                        navigation::Action::Exit => {
+                            if let Some(code) = exit_code {
+                                return Ok(code);
+                            }
+                            confirm_exit = true;
+                        }
+                        navigation::Action::SelectSession(index) => {
+                            if let Some(sessions) = &mut sessions {
+                                sessions.active =
+                                    index.checked_sub(1).map(|i| sessions.panes[i].id);
+                                view.history = false;
+                                view.follow = false;
+                            }
+                        }
+                        navigation::Action::Handled => {
+                            if view.focused && view.panel == Panel::Sessions {
+                                view.follow = false;
+                            }
+                        }
                     }
-                    confirm_exit = true;
                 } else if key.modifiers.contains(KeyModifiers::SHIFT)
                     && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
                 {
-                    let offset = if view.history {
-                        view.offset
-                    } else {
-                        active_screen(&parser, &sessions).scrollback()
-                    };
-                    let offset = if key.code == KeyCode::PageUp {
-                        offset.saturating_add(usize::from(size.rows))
-                    } else {
-                        offset.saturating_sub(usize::from(size.rows))
-                    };
-                    if view.history {
-                        let count = parser
-                            .callbacks()
-                            .progress
-                            .as_ref()
-                            .map_or(0, |p| history_lines(p, size.cols).len());
-                        view.offset = offset.min(count.saturating_sub(usize::from(size.rows)));
-                    } else {
-                        view.follow = offset == 0;
-                        if let Some(pane) =
-                            sessions.as_mut().and_then(execution::Sessions::active_mut)
-                        {
-                            pane.parser.screen_mut().set_scrollback(offset);
-                        } else {
-                            parser.screen_mut().set_scrollback(offset);
-                        }
-                    }
+                    scroll_output(
+                        &mut parser,
+                        &mut sessions,
+                        &mut view,
+                        size,
+                        key.code == KeyCode::PageUp,
+                        usize::from(size.rows),
+                    );
                 } else if view.history || active_screen(&parser, &sessions).scrollback() > 0 {
                     // Browsing is read-only: never send an unseen answer to a prompt.
-                } else if let Some(code) = exit_code {
-                    if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-                        return Ok(code);
+                    match key.code {
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            scroll_output(&mut parser, &mut sessions, &mut view, size, true, 1);
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            scroll_output(&mut parser, &mut sessions, &mut view, size, false, 1);
+                        }
+                        _ => {}
                     }
-                } else {
+                } else if exit_code.is_none() {
                     parser.screen_mut().set_scrollback(0);
                     let bytes =
                         encode_key(key, active_screen(&parser, &sessions).application_cursor());
@@ -514,6 +670,41 @@ fn run_session(
             }
             _ => {}
         }
+    }
+}
+
+fn scroll_output(
+    parser: &mut vt100::Parser<Responses>,
+    sessions: &mut Option<execution::Sessions>,
+    view: &mut View,
+    size: PtySize,
+    up: bool,
+    lines: usize,
+) {
+    let offset = if view.history {
+        view.offset
+    } else {
+        active_screen(parser, sessions).scrollback()
+    };
+    let offset = if up {
+        offset.saturating_add(lines)
+    } else {
+        offset.saturating_sub(lines)
+    };
+    if view.history {
+        let count = parser
+            .callbacks()
+            .progress
+            .as_ref()
+            .map_or(0, |p| history_lines(p, size.cols).len());
+        view.offset = offset.min(count.saturating_sub(usize::from(size.rows)));
+    } else {
+        let screen = sessions
+            .as_mut()
+            .and_then(execution::Sessions::active_mut)
+            .map_or_else(|| parser.screen_mut(), |pane| pane.parser.screen_mut());
+        screen.set_scrollback(offset);
+        view.follow = screen.scrollback() == 0;
     }
 }
 
@@ -617,12 +808,17 @@ fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
 }
 
 struct View {
+    panel: Panel,
+    focused: bool,
     history: bool,
     offset: usize,
     follow: bool,
     session: Option<SessionView>,
-    session_list: Vec<String>,
+    session_list: Vec<Line<'static>>,
     selected_session: usize,
+    session_offset: usize,
+    selected_target: usize,
+    target_count: usize,
 }
 
 struct SessionView {
@@ -634,12 +830,17 @@ struct SessionView {
 impl Default for View {
     fn default() -> Self {
         Self {
+            panel: Panel::Output,
+            focused: false,
             history: false,
             offset: 0,
             follow: true,
             session: None,
             session_list: Vec::new(),
             selected_session: 0,
+            session_offset: 0,
+            selected_target: 0,
+            target_count: 0,
         }
     }
 }
@@ -674,13 +875,10 @@ fn render(
 ) {
     let (sidebar, pane, footer) = regions(frame.area());
     if sidebar.width > 0 {
-        let left = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(7), Constraint::Min(1)])
-            .split(sidebar);
+        let (header_area, target_area, session_area) = sidebar_regions(sidebar, progress.is_some());
         let header = if let Some(progress) = progress {
             format!(
-                "开始: {}\n策略: {}\n阶段: {}\nF2: 输出 / 流程记录",
+                "开始: {}\n策略: {}\n阶段: {}\nF2 / 点击: 流程记录",
                 progress.start_time, progress.profile, progress.phase,
             )
         } else {
@@ -700,7 +898,7 @@ fn render(
                     })
                     .borders(Borders::ALL),
             ),
-            left[0],
+            header_area,
         );
         let targets = if let Some(progress) = progress {
             progress
@@ -724,42 +922,58 @@ fn render(
                 .into_iter()
                 .collect()
         };
-        let notice_height = if progress.is_some() && left[1].height >= 12 {
-            6
-        } else {
-            0
-        };
-        let target_areas =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(notice_height)])
-                .split(left[1]);
-        frame.render_widget(
-            List::new(targets).block(
-                Block::default()
-                    .title(if progress.is_some() {
-                        "目标"
-                    } else {
-                        "目标（占位）"
-                    })
-                    .borders(Borders::ALL),
-            ),
-            target_areas[0],
+        let offset = target_list_offset(view, target_area);
+        let rows = usize::from(Block::bordered().inner(target_area).height);
+        let mut target_state = ratatui::widgets::ListState::default().with_selected(
+            (view.panel == Panel::Targets).then_some(view.selected_target.saturating_sub(offset)),
+        );
+        frame.render_stateful_widget(
+            List::new(targets.into_iter().skip(offset).take(rows))
+                .block(
+                    Block::default()
+                        .title(if progress.is_some() {
+                            "目标"
+                        } else {
+                            "目标（占位）"
+                        })
+                        .borders(Borders::ALL)
+                        .border_style(navigation::border(view, Panel::Targets)),
+                )
+                .highlight_style(Style::default().bg(Color::DarkGray)),
+            target_area,
+            &mut target_state,
         );
         if !view.session_list.is_empty() {
+            let offset = session_list_offset(view, session_area);
+            let rows = usize::from(Block::bordered().inner(session_area).height);
             let list = List::new(
                 view.session_list
                     .iter()
-                    .map(|line| ListItem::new(line.as_str())),
+                    .skip(offset)
+                    .take(rows)
+                    .enumerate()
+                    .map(|(index, line)| {
+                        let style = if index + offset == view.selected_session {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default()
+                        };
+                        ListItem::new(line.clone()).style(style)
+                    }),
             )
-            .block(Block::bordered().title("会话 · F5/F6 切换"))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+            .block(
+                Block::bordered()
+                    .title("会话 · 点击 / 滚轮")
+                    .border_style(navigation::border(view, Panel::Sessions)),
             )
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD))
             .highlight_symbol("> ");
-            let mut selected =
-                ratatui::widgets::ListState::default().with_selected(Some(view.selected_session));
-            frame.render_stateful_widget(list, target_areas[1], &mut selected);
+            let selected = view
+                .selected_session
+                .checked_sub(offset)
+                .filter(|index| *index < rows);
+            let mut selected = ratatui::widgets::ListState::default().with_selected(selected);
+            frame.render_stateful_widget(list, session_area, &mut selected);
         } else if let Some(progress) = progress {
             frame.render_widget(
                 Paragraph::new(
@@ -770,7 +984,7 @@ fn render(
                 )
                 .wrap(Wrap { trim: false })
                 .block(Block::bordered().title("最新消息 · F2 查看记录")),
-                target_areas[1],
+                session_area,
             );
         }
     }
@@ -792,7 +1006,7 @@ fn render(
                 session.code.map_or_else(
                     || {
                         if session.interactive {
-                            "运行中 · 可直接输入"
+                            "运行中 · 聚焦终端后输入"
                         } else {
                             "查询中 · 输出可供业务解析"
                         }
@@ -819,7 +1033,7 @@ fn render(
         if let Some(code) = session.code {
             format!("命令输出 · exit {code} · 只读")
         } else if session.interactive {
-            "命令输出 · 输入直接发送".to_string()
+            "命令输出 · 聚焦终端后输入".to_string()
         } else {
             "查询输出 · 只读".to_string()
         }
@@ -829,7 +1043,7 @@ fn render(
                 if progress.is_some_and(|p| p.phase == "检查") {
                     "检查结果 · 正在检查，进度见左侧".to_string()
                 } else {
-                    "终端输出 · 可直接输入".to_string()
+                    "终端输出 · Enter / 点击聚焦".to_string()
                 }
             },
             |code| format!("终端已退出 · exit {code}"),
@@ -838,7 +1052,7 @@ fn render(
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(navigation::border(view, Panel::Output));
     let inner = block.inner(pane);
     frame.render_widget(block, pane);
     if view.history {
@@ -880,7 +1094,9 @@ fn render(
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(lines), inner);
     }
-    if !view.history
+    if view.focused
+        && view.panel == Panel::Output
+        && !view.history
         && view
             .session
             .as_ref()
@@ -897,31 +1113,44 @@ fn render(
     }
     let help = if confirm_exit {
         "结束当前终端进程并退出？ Y: 确认  N/Esc: 返回"
+    } else if !view.focused {
+        "导航 · hjkl/方向键: 切换面板 · Enter: 聚焦 · q: 退出"
+    } else if view.panel != Panel::Output {
+        "面板已聚焦 · hjkl/方向键: 切换条目 · Esc: 退焦 · 退焦后 q: 退出"
     } else if view.history || screen.scrollback() > 0 {
-        "只读回看 · Shift+PgUp/PgDn: 翻页 · F4: 返回实时 · F10: 退出"
+        "只读回看 · 滚轮/Shift+PgUp/PgDn: 翻页 · F4: 实时 · Esc: 退焦"
     } else if exit_code.is_some() && progress.is_some_and(business::Progress::has_deferred) {
-        "Enter/Esc: 退出并执行收尾更新 · Shift+PgUp/PgDn: 回看输出"
+        "流程已结束 · Esc 退焦后 q: 退出并执行收尾更新"
     } else if exit_code.is_some() {
-        "Enter / Esc / F10: 返回 · Shift+PgUp/PgDn: 回看输出"
+        "终端已结束 · Esc: 退焦 · 退焦后 q: 退出 · 滚轮: 回看输出"
     } else {
-        "Ctrl+C: 发送中断 · Shift+PgUp/PgDn: 回看输出 · F10: 退出"
+        "终端已聚焦 · Esc: 退焦 · Ctrl+C: 中断 · 滚轮: 回看输出"
     };
     frame.render_widget(
-        Paragraph::new(format!(
-            "{help}\n{}",
-            if progress.is_some() {
-                "F2: 流程记录 · F4: 当前交互 · F5/F6: 切换命令会话"
-            } else {
-                "F4: 返回实时输入 · 回看时暂停键盘输入"
-            }
-        ))
-        .style(Style::default().fg(if confirm_exit {
+        Paragraph::new(help).style(Style::default().fg(if confirm_exit {
             Color::Yellow
         } else {
             Color::DarkGray
         })),
-        footer,
+        Rect {
+            height: footer.height.min(1),
+            ..footer
+        },
     );
+    for (area, label, _) in mouse::footer_buttons(footer, progress.is_some(), confirm_exit) {
+        frame.render_widget(
+            Paragraph::new(label).style(
+                Style::default()
+                    .fg(if confirm_exit {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    })
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            area,
+        );
+    }
 }
 
 fn status_style(status: business::Status) -> Style {
@@ -984,7 +1213,7 @@ pub async fn run_demo() -> i32 {
         return 1;
     }
     println!("\r\n收到输入: {}\r", answer.trim_end());
-    println!("\x1b[32m交互完成。可以调整窗口大小，或按 Enter 返回。\x1b[0m\r");
+    println!("\x1b[32m交互完成。可以调整窗口大小，Esc 退焦后按 q 返回。\x1b[0m\r");
     0
 }
 
@@ -993,6 +1222,75 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use std::time::Instant;
+
+    #[test]
+    fn output_and_activity_scroll_independently_and_clamp_at_both_ends() {
+        let mut progress = business::Progress::new(&[], "test", "now");
+        progress.history = (0..20).map(|i| format!("event {i}")).collect();
+        let mut parser = vt100::Parser::new_with_callbacks(
+            nonzero(4),
+            nonzero(12),
+            50,
+            Responses {
+                bytes: Vec::new(),
+                progress: Some(progress),
+            },
+        );
+        for i in 0..20 {
+            parser.process(format!("line {i}\r\n").as_bytes());
+        }
+        let size = PtySize {
+            rows: 4,
+            cols: 12,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut view = View::default();
+        let mut sessions = None;
+        scroll_output(&mut parser, &mut sessions, &mut view, size, true, 3);
+        assert_eq!(parser.screen().scrollback(), 3);
+        assert!(!view.follow);
+        view.history = true;
+        scroll_output(
+            &mut parser,
+            &mut sessions,
+            &mut view,
+            size,
+            true,
+            usize::MAX,
+        );
+        assert_eq!(view.offset, 16);
+        assert_eq!(parser.screen().scrollback(), 3);
+        scroll_output(
+            &mut parser,
+            &mut sessions,
+            &mut view,
+            size,
+            false,
+            usize::MAX,
+        );
+        assert_eq!(view.offset, 0);
+        view.history = false;
+        scroll_output(
+            &mut parser,
+            &mut sessions,
+            &mut view,
+            size,
+            true,
+            usize::MAX,
+        );
+        assert!(parser.screen().scrollback() > 3);
+        scroll_output(
+            &mut parser,
+            &mut sessions,
+            &mut view,
+            size,
+            false,
+            usize::MAX,
+        );
+        assert_eq!(parser.screen().scrollback(), 0);
+        assert!(view.follow);
+    }
 
     #[test]
     fn workflow_layout_keeps_commands_messages_and_pty_output_separate() {

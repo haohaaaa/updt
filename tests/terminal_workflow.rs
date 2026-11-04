@@ -154,6 +154,52 @@ fn validation_modes_cannot_be_combined_with_update_targets() {
 
 #[test]
 fn terminal_demo_executes_via_internal_api_routes_input_and_switches_sessions() {
+    run_terminal_demo(false, None);
+}
+
+#[test]
+fn terminal_demo_supports_mouse_focus_session_selection_and_exit() {
+    run_terminal_demo(true, None);
+}
+
+#[test]
+fn terminal_demo_supports_hjkl_panel_and_session_navigation() {
+    run_terminal_demo(false, Some(b"hj\rjj"));
+}
+
+#[test]
+fn terminal_demo_supports_arrow_panel_and_session_navigation() {
+    run_terminal_demo(false, Some(b"\x1b[D\x1b[B\r\x1b[B\x1b[B"));
+}
+
+fn click_ascii(screen: &vt100::Screen, text: &str, max_col: u16) -> Vec<u8> {
+    let (rows, cols) = screen.size();
+    for row in 0..rows.get() {
+        for col in 0..cols
+            .get()
+            .min(max_col)
+            .saturating_sub(text.len() as u16 - 1)
+        {
+            if text.chars().enumerate().all(|(i, ch)| {
+                screen
+                    .cell(row, col + i as u16)
+                    .is_some_and(|cell| cell.contents() == ch.to_string())
+            }) {
+                return format!(
+                    "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+                    col + 1,
+                    row + 1,
+                    col + 1,
+                    row + 1
+                )
+                .into_bytes();
+            }
+        }
+    }
+    panic!("missing clickable text {text}: {}", screen.contents());
+}
+
+fn run_terminal_demo(mouse: bool, navigation: Option<&[u8]>) {
     let pair = portable_pty::native_pty_system()
         .openpty(PtySize {
             rows: 32,
@@ -189,6 +235,8 @@ fn terminal_demo_executes_via_internal_api_routes_input_and_switches_sessions() 
     let mut answered = false;
     let mut switched = false;
     let mut exited = false;
+    let mut blurred = false;
+    let mut navigation_started = false;
     loop {
         if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(20)) {
             parser.process(&bytes);
@@ -200,7 +248,12 @@ fn terminal_demo_executes_via_internal_api_routes_input_and_switches_sessions() 
         }
         let screen = parser.screen().contents();
         if !answered && screen.contains("输入任意文字后按 Enter") {
-            writer.write_all(b"hello\r").unwrap();
+            if mouse {
+                writer.write_all(b"\x1b[<0;40;10M\x1b[<0;40;10m").unwrap();
+            } else {
+                writer.write_all(b"\r").unwrap(); // Enter focuses the output pane.
+            }
+            writer.write_all(b"hello qhjkl\r").unwrap();
             writer.flush().unwrap();
             answered = true;
         }
@@ -208,14 +261,46 @@ fn terminal_demo_executes_via_internal_api_routes_input_and_switches_sessions() 
             && !switched
             && screen.contains("内部 API 收到交互命令结果")
             && screen.contains("终端已退出")
+            && (!mouse || screen.contains("#2 完成"))
         {
-            writer.write_all(b"\x1b[15~").unwrap(); // F5: last command session
-            writer.flush().unwrap();
-            switched = true;
+            if navigation.is_some() && !navigation_started {
+                writer.write_all(b"\x1b").unwrap();
+                writer.flush().unwrap();
+                navigation_started = true;
+            } else if navigation.is_none() || screen.contains("导航 · hjkl/方向键") {
+                if mouse {
+                    writer
+                        .write_all(&click_ascii(parser.screen(), "#2", 30))
+                        .unwrap();
+                } else if let Some(keys) = navigation {
+                    writer.write_all(keys).unwrap();
+                } else {
+                    writer.write_all(b"\x1b[15~").unwrap(); // F5: last command session
+                }
+                writer.flush().unwrap();
+                switched = true;
+            }
         }
-        if switched && !exited && screen.contains("收到: hello") && screen.contains("命令输出")
+        if switched
+            && !blurred
+            && screen.contains("收到: hello qhjkl")
+            && screen.contains("命令输出")
+            && (!mouse || screen.contains("[q 退出]"))
         {
-            writer.write_all(b"\x1b[17~\r").unwrap(); // F6: workflow; Enter: exit
+            if mouse {
+                writer
+                    .write_all(&click_ascii(parser.screen(), "q ", 130))
+                    .unwrap();
+                exited = true;
+            } else {
+                // Enter no longer exits a completed workflow. Esc only blurs it.
+                writer.write_all(b"\x1b[17~\r\x1b").unwrap();
+            }
+            writer.flush().unwrap();
+            blurred = true;
+        }
+        if blurred && !exited && screen.contains("导航 · hjkl/方向键") {
+            writer.write_all(b"q").unwrap();
             writer.flush().unwrap();
             exited = true;
         }

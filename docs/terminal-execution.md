@@ -33,7 +33,7 @@ let result = terminal::execution::execute(
 | Mode | Execution | Returned output | Input |
 | --- | --- | --- | --- |
 | `Capture` | Process with stdout/stderr pipes | Separate byte-exact `stdout` and `stderr`; `terminal_output` is empty | stdin is closed |
-| `Interactive` | Process in a native PTY | `terminal_output` contains merged terminal bytes; `stdout` and `stderr` are empty | Keyboard/paste forwarded to the selected live session |
+| `Interactive` | Process in a native PTY | `terminal_output` contains merged terminal bytes; `stdout` and `stderr` are empty | Keyboard/paste forwarded when terminal output is focused; mouse reports follow the child's requested mode |
 
 PTY output is terminal data. It may contain colors, carriage returns, cursor
 movement, and echoed input. Use capture mode for machine-readable JSON. The UI
@@ -77,5 +77,7 @@ cargo run -- terminal --demo
 ```
 
 The demo validates separate JSON/stdout and stderr capture, then accepts input
-in an interactive command. Use F5/F6 to inspect either command afterward. No
+in an interactive command after Enter or a click focuses its output. Use F5/F6
+or click the session list to inspect either command afterward. Esc leaves panel
+focus; `q` in navigation mode exits. No
 package manager or update operation is run by this demo.
