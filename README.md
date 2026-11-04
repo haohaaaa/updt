@@ -145,6 +145,37 @@ Selector controls:
 
 ## CLI Reference
 
+### Two interactive interfaces
+
+The original interface and the embedded terminal interface have separate entry points:
+
+| Command | Interface |
+| --- | --- |
+| `updt` | Original TUI: checks, target selection and confirmation, then command output |
+| `updt update npm cargo` | Original interface for the requested targets |
+| `updt terminal` | New interface: real target status on the left, checks, confirmation and updates inside the terminal on the right |
+| `updt terminal npm cargo` | New interface for the requested targets; updates the selected targets that have updates |
+
+Without explicit targets, the new interface asks which targets to update in the right-hand terminal. Answer package-manager prompts there as well. Check commands stream their output while retaining separate captured output for parsing. Update order and deferred Windows updates use the same business logic as the original interface.
+
+On Windows, deferred `rustup` and `updt` updates wait for the **outer terminal interface** to exit, so its executable no longer holds the installation directory open. Once the workflow finishes, press Enter or Esc to close the interface and allow those updates to run.
+
+The new interface uses a native PTY (ConPTY on Windows), with ANSI colors, Unicode, terminal resizing, keyboard input, paste, and up to 2,000 lines of scrollback. The standalone validation modes remain available:
+
+```bash
+updt terminal --demo
+updt terminal --shell
+```
+
+`--demo` runs a small color/progress/input demonstration without executing package-manager commands. `--shell` opens PowerShell on Windows or `$SHELL` (falling back to `/bin/sh`) on Unix without starting the update workflow. Commands you type run in that shell.
+
+- Type directly in the terminal; `Ctrl+C` is forwarded to the child terminal.
+- Use `Shift+PageUp` / `Shift+PageDown` to review output. Typing returns to live output.
+- Use `exit` to end the shell, then `Enter` or `Esc` to return.
+- `F10` asks for confirmation before ending a running terminal; it closes a finished terminal immediately.
+
+The new interface currently has one shared terminal pane; the sidebar shows status rather than selecting individual terminal sessions. Mouse forwarding and full compatibility with arbitrary terminal applications are not yet validated.
+
 Show the installed version:
 
 ```bash

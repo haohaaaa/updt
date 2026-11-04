@@ -112,7 +112,17 @@ async fn run_pacman_at_position(
     before_standard_targets: bool,
 ) -> bool {
     if plan.should_run(before_standard_targets) {
-        run_pacman_upgrade(state).await
+        crate::terminal::business::report("pacman", crate::terminal::business::Status::Updating);
+        let success = run_pacman_upgrade(state).await;
+        crate::terminal::business::report(
+            "pacman",
+            if success {
+                crate::terminal::business::Status::Updated
+            } else {
+                crate::terminal::business::Status::Failed
+            },
+        );
+        success
     } else {
         true
     }
@@ -212,13 +222,28 @@ async fn run_selected_standard_targets(
 ) -> StandardUpgradeOutcome {
     let mut outcome = StandardUpgradeOutcome::default();
     for target in selected_standard_targets(targets, selected) {
+        crate::terminal::business::report(target.id, crate::terminal::business::Status::Updating);
         let target_outcome = (target.run)(state, self_pkg).await;
+        crate::terminal::business::report(target.id, standard_target_status(&target_outcome));
         if target_outcome.failed {
             outcome.failures.record_target(target.id);
         }
         outcome.merge(target_outcome);
     }
     outcome
+}
+
+fn standard_target_status(outcome: &StandardUpgradeOutcome) -> crate::terminal::business::Status {
+    use crate::terminal::business::Status;
+    let pending = (cfg!(windows) && outcome.cargo_self_needs_update)
+        || !outcome.deferred_scoop_tasks.is_empty();
+    match (outcome.failed, pending) {
+        (true, true) => Status::PartialDeferred,
+        (true, false) => Status::Failed,
+        (false, true) => Status::Deferred,
+        (false, false) if outcome.cargo_self_needs_update => Status::Queued,
+        (false, false) => Status::Updated,
+    }
 }
 
 fn selected_standard_targets<'a>(
@@ -297,6 +322,18 @@ async fn finish_deferred_upgrades(
                 for label in labels {
                     failures.record_label(&label);
                 }
+                if !outcome.deferred_scoop_tasks.is_empty() {
+                    crate::terminal::business::report(
+                        "scoop",
+                        crate::terminal::business::Status::Failed,
+                    );
+                }
+                if self_update.is_some() {
+                    crate::terminal::business::report(
+                        "cargo",
+                        crate::terminal::business::Status::Failed,
+                    );
+                }
                 for task in &outcome.deferred_scoop_tasks {
                     println!(
                         "[scoop] 可手动执行: {}",
@@ -312,8 +349,20 @@ async fn finish_deferred_upgrades(
     }
     #[cfg(not(windows))]
     {
-        if outcome.cargo_self_needs_update && !upgrade_cargo_self(self_pkg).await {
-            failures.record_label("cargo (updt 自身)");
+        if outcome.cargo_self_needs_update {
+            crate::terminal::business::report("cargo", crate::terminal::business::Status::Updating);
+            let success = upgrade_cargo_self(self_pkg).await;
+            if !success {
+                failures.record_label("cargo (updt 自身)");
+            }
+            crate::terminal::business::report(
+                "cargo",
+                if !success || outcome.failures.labels.iter().any(|label| label == "cargo") {
+                    crate::terminal::business::Status::Failed
+                } else {
+                    crate::terminal::business::Status::Updated
+                },
+            );
         }
         Vec::new()
     }
@@ -547,6 +596,7 @@ fn print_upgrade_summary(
     failures: &UpgradeFailures,
     pending: &[String],
 ) -> bool {
+    crate::terminal::business::phase("summary");
     print_section("汇总");
     println!(
         "已选择升级项: {}",
@@ -1444,7 +1494,11 @@ async fn schedule_windows_final_updates(
     } else {
         "powershell.exe"
     };
-    let script = windows_final_update_script(process::id(), scoop_tasks, self_pkg);
+    let script = windows_final_update_script(
+        crate::terminal::business::update_owner_pid(),
+        scoop_tasks,
+        self_pkg,
+    );
     let launcher = windows_final_update_launcher(shell, &script);
     let (status, output) = run_capture(
         shell,
@@ -1557,6 +1611,39 @@ mod tests {
         scoop_retry_after_kill,
     };
     use crate::parse::ScoopExportApp;
+
+    #[test]
+    fn terminal_status_distinguishes_completion_failure_and_deferred_updates() {
+        use super::{StandardUpgradeOutcome, standard_target_status};
+        use crate::terminal::business::Status;
+        assert_eq!(
+            standard_target_status(&StandardUpgradeOutcome::from_success(true)),
+            Status::Updated
+        );
+        assert_eq!(
+            standard_target_status(&StandardUpgradeOutcome::from_success(false)),
+            Status::Failed
+        );
+        let mut deferred = StandardUpgradeOutcome::from_success(true);
+        deferred.cargo_self_needs_update = true;
+        assert_eq!(
+            standard_target_status(&deferred),
+            if cfg!(windows) {
+                Status::Deferred
+            } else {
+                Status::Queued
+            }
+        );
+        deferred.failed = true;
+        assert_eq!(
+            standard_target_status(&deferred),
+            if cfg!(windows) {
+                Status::PartialDeferred
+            } else {
+                Status::Failed
+            }
+        );
+    }
 
     #[test]
     fn merging_upgrade_outcomes_keeps_all_deferred_tasks() {

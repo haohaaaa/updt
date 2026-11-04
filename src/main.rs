@@ -13,6 +13,7 @@ mod parse;
 mod profile;
 mod selection;
 mod state;
+mod terminal;
 mod ui;
 mod upgrade;
 
@@ -48,6 +49,39 @@ async fn run_app() -> i32 {
     if let Some(code) = handle_fish_command(&cli).await {
         return code;
     }
+    if matches!(cli, CliCommand::TerminalDemo) {
+        return terminal::run_demo();
+    }
+    if let CliCommand::TerminalWorker { owner_pid, .. } = &cli {
+        terminal::business::enable_worker(*owner_pid);
+    }
+    if let CliCommand::Terminal {
+        targets,
+        demo,
+        shell,
+    } = &cli
+    {
+        let result = if *demo || *shell {
+            let shell = terminal::default_shell().await;
+            tokio::task::block_in_place(|| terminal::run(&shell, *demo))
+        } else {
+            let ctx = RunContext::new(targets.clone()).await;
+            let check_targets = resolve_check_targets(&ctx.state, targets);
+            let progress = terminal::business::Progress::new(
+                &check_targets,
+                profile_name(ctx.state.system_profile),
+                &ctx.start_time,
+            );
+            tokio::task::block_in_place(|| terminal::run_workflow(targets, progress))
+        };
+        return match result {
+            Ok(code) => code,
+            Err(err) => {
+                eprintln!("[terminal] 无法运行嵌入式终端: {err}");
+                1
+            }
+        };
+    }
 
     let mut ctx = RunContext::new(requested_updates(&cli)).await;
     if let Some(code) = try_interactive_start(&mut ctx).await {
@@ -56,6 +90,7 @@ async fn run_app() -> i32 {
 
     print_text_header_if_needed(&ctx);
     run_checks_for_context(&mut ctx).await;
+    terminal::business::phase("preparing");
     offer_install_cargo_update(&mut ctx.state).await;
     offer_install_cargo_binstall(&ctx.state).await;
     finish_after_checks(&mut ctx).await
@@ -70,7 +105,7 @@ impl RunContext {
             state,
             requested_updates,
             start_time,
-            force_text_flow: false,
+            force_text_flow: terminal::business::is_worker(),
         }
     }
 }
@@ -93,13 +128,13 @@ async fn handle_fish_command(cli: &CliCommand) -> Option<i32> {
 
 fn requested_updates(cli: &CliCommand) -> Vec<String> {
     match cli {
-        CliCommand::Update(v) => v.clone(),
+        CliCommand::Update(v) | CliCommand::TerminalWorker { targets: v, .. } => v.clone(),
         _ => Vec::new(),
     }
 }
 
 async fn try_interactive_start(ctx: &mut RunContext) -> Option<i32> {
-    if interactive_terminal() {
+    if interactive_terminal() && !terminal::business::is_worker() {
         return handle_interactive_result(
             run_interactive_flow(&mut ctx.state, &ctx.requested_updates, &ctx.start_time).await,
             ctx,
@@ -131,6 +166,7 @@ async fn handle_interactive_result(
 }
 
 async fn upgrade_exit_code(state: &AppState, selected_targets: &[String]) -> i32 {
+    terminal::business::phase("upgrading");
     if upgrade_selected(state, selected_targets).await {
         0
     } else {
@@ -155,6 +191,7 @@ fn print_text_header_if_needed(ctx: &RunContext) {
 }
 
 async fn run_checks_for_context(ctx: &mut RunContext) {
+    terminal::business::phase("checking");
     if ctx.force_text_flow {
         let targets = resolve_check_targets(&ctx.state, &ctx.requested_updates);
         run_checks_plain(&mut ctx.state, &targets).await;
@@ -178,6 +215,7 @@ async fn finish_after_checks(ctx: &mut RunContext) -> i32 {
 }
 
 fn no_upgrades_exit_code(state: &AppState) -> i32 {
+    terminal::business::phase("summary");
     print_section("汇总");
     println!("{}", ok_text("没有可升级项."));
     if any_check_failed(state) {
@@ -189,6 +227,7 @@ fn no_upgrades_exit_code(state: &AppState) -> i32 {
 }
 
 async fn select_after_checks(ctx: &RunContext, upgradable_targets: &[String]) -> Vec<String> {
+    terminal::business::phase("selecting");
     if !ctx.requested_updates.is_empty() {
         return resolve_cli_selection(&ctx.requested_updates, upgradable_targets);
     }

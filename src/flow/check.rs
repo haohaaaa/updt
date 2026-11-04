@@ -64,7 +64,9 @@ fn spawn_check_workers(
         let tx_task = tx.clone();
         set.spawn(async move {
             let _ = tx_task.send(CheckEvent::Started(t.clone()));
+            crate::terminal::business::report(&t, crate::terminal::business::Status::Checking);
             let result = run_single_check(&t).await;
+            crate::terminal::business::checked(&t, &result.state);
             let (kind, summary) = summarize_target_status(&t, &result.state);
             let _ = tx_task.send(CheckEvent::Finished {
                 target: t,

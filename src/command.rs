@@ -112,6 +112,9 @@ async fn is_executable(path: &Path) -> bool {
 }
 
 pub async fn run_output(program: &str, args: &[&str]) -> io::Result<Output> {
+    if crate::terminal::business::is_worker() {
+        return run_output_streaming(program, args, false).await;
+    }
     command(program).await.args(args).output().await
 }
 
@@ -125,10 +128,30 @@ pub async fn run_capture(program: &str, args: &[&str]) -> io::Result<(i32, Strin
 }
 
 pub async fn run_capture_streaming(program: &str, args: &[&str]) -> io::Result<(i32, String)> {
+    let output =
+        run_output_streaming(program, args, crate::terminal::business::is_worker()).await?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok((output.status.code().unwrap_or(-1), text))
+}
+
+async fn run_output_streaming(
+    program: &str,
+    args: &[&str],
+    inherit_input: bool,
+) -> io::Result<Output> {
+    print_worker_command(program, args);
     let mut child = command(program)
         .await
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if inherit_input {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -145,16 +168,16 @@ pub async fn run_capture_streaming(program: &str, args: &[&str]) -> io::Result<(
     let stdout_task = tokio::spawn(read_streaming_output(stdout));
     let stderr_task = tokio::spawn(read_streaming_output(stderr));
     let status = child.wait().await?;
-    let stdout_text = join_stream_reader(stdout_task).await?;
-    let stderr_text = join_stream_reader(stderr_task).await?;
-
-    let mut text = String::new();
-    text.push_str(&stdout_text);
-    text.push_str(&stderr_text);
-    Ok((status.code().unwrap_or(-1), text))
+    let stdout = join_stream_reader(stdout_task).await?;
+    let stderr = join_stream_reader(stderr_task).await?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
-async fn read_streaming_output<R>(mut reader: R) -> io::Result<String>
+async fn read_streaming_output<R>(mut reader: R) -> io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -171,7 +194,7 @@ where
         bytes.extend_from_slice(&buffer[..read]);
     }
 
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
 }
 
 fn write_stream_chunk(bytes: &[u8]) -> io::Result<()> {
@@ -181,14 +204,15 @@ fn write_stream_chunk(bytes: &[u8]) -> io::Result<()> {
 }
 
 async fn join_stream_reader(
-    handle: tokio::task::JoinHandle<io::Result<String>>,
-) -> io::Result<String> {
+    handle: tokio::task::JoinHandle<io::Result<Vec<u8>>>,
+) -> io::Result<Vec<u8>> {
     handle
         .await
         .map_err(|err| io::Error::other(format!("stream reader task failed: {err}")))?
 }
 
 pub async fn run_inherit(program: &str, args: &[&str]) -> io::Result<bool> {
+    print_worker_command(program, args);
     let status = command(program)
         .await
         .args(args)
@@ -198,6 +222,22 @@ pub async fn run_inherit(program: &str, args: &[&str]) -> io::Result<bool> {
         .status()
         .await?;
     Ok(status.success())
+}
+
+fn print_worker_command(program: &str, args: &[&str]) {
+    if !crate::terminal::business::is_worker() {
+        return;
+    }
+    let script = args
+        .iter()
+        .position(|arg| arg.eq_ignore_ascii_case("-Command"));
+    let args = args[..script.unwrap_or(args.len())].join(" ");
+    let label = format!("{program} {args}");
+    let short = label.chars().take(180).collect::<String>();
+    println!(
+        "\n$ {short}{}",
+        if script.is_some() { " [script]" } else { "" }
+    );
 }
 
 pub async fn run_cargo_install_update_capture(args: &[&str]) -> io::Result<(i32, String)> {
@@ -210,4 +250,35 @@ pub async fn run_cargo_install_update_inherit(args: &[&str]) -> io::Result<bool>
     let mut proxy_args = vec!["install-update", "--locked"];
     proxy_args.extend_from_slice(args);
     run_inherit("cargo-install-update", &proxy_args).await
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn streaming_preserves_separate_output_and_nonzero_exit_status() {
+        #[cfg(windows)]
+        let output = super::run_output_streaming(
+            "powershell.exe",
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "[Console]::Out.Write('{\"ok\":true}'); [Console]::Error.Write('progress'); exit 3",
+            ],
+            false,
+        )
+        .await
+        .unwrap();
+        #[cfg(not(windows))]
+        let output = super::run_output_streaming(
+            "/bin/sh",
+            &["-c", "printf '{\"ok\":true}'; printf progress >&2; exit 3"],
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"{\"ok\":true}");
+        assert_eq!(output.stderr, b"progress");
+    }
 }
