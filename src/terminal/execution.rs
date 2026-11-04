@@ -101,7 +101,7 @@ pub async fn run_demo() -> io::Result<()> {
             "-NoLogo",
             "-NoProfile",
             "-Command",
-            "[Console]::Write('输入任意文字后按 Enter: '); $answer = [Console]::ReadLine(); [Console]::WriteLine('收到: ' + $answer); exit 0",
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::Write('输入任意文字后按 Enter: '); $answer = [Console]::ReadLine(); [Console]::WriteLine('收到: ' + $answer); exit 0",
         ],
     );
     #[cfg(not(windows))]
@@ -299,7 +299,7 @@ impl Sessions {
                     Ok((mut stream, _)) => {
                         // One local workflow owns the endpoint. Do not let an
                         // unauthenticated peer submit commands to the UI.
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                         if let Ok(request) = read_frame::<Request>(&mut stream, 1024 * 1024)
                             && request.token == secret
                         {
@@ -737,7 +737,19 @@ mod tests {
             .unwrap();
         write_frame(&mut stream, &request).unwrap();
         let mut byte = [0];
-        assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        // Rejecting a peer can report EOF or a reset/broken pipe depending on
+        // the OS; all mean the unauthenticated connection was closed.
+        match stream.read(&mut byte) {
+            Ok(0) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                ) => {}
+            other => panic!("unauthenticated connection was not rejected: {other:?}"),
+        }
         sessions.poll(size(), true).unwrap();
         assert!(sessions.panes.is_empty());
     }
