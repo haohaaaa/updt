@@ -241,6 +241,7 @@ pub(super) struct Pane {
     reply: Option<TcpStream>,
     bytes: Vec<u8>,
     eof: bool,
+    exited: Option<i32>,
 }
 
 impl Pane {
@@ -430,24 +431,30 @@ impl Sessions {
             if !responses.is_empty() {
                 pty.write(&responses)?;
             }
-            if let Some(status) = pty.child.try_wait()? {
+            if pane.exited.is_none()
+                && let Some(status) = pty.child.try_wait()?
+            {
+                // Preserve the observed command exit code before closing
+                // ConPTY. Teardown can otherwise replace it with CTRL_CLOSE.
+                pane.exited = Some(status.exit_code() as i32);
                 pty.close_output();
-                if pane.eof {
-                    let code = status.exit_code() as i32;
-                    if let Some(stream) = pane.reply.take() {
-                        reply(
-                            stream,
-                            Ok(CommandResult {
-                                code,
-                                stdout: Vec::new(),
-                                stderr: Vec::new(),
-                                terminal_output: std::mem::take(&mut pane.bytes),
-                            }),
-                        );
-                    }
-                    pane.pty.take();
-                    pane.finish(Ok(code));
+            }
+            if let Some(code) = pane.exited
+                && pane.eof
+            {
+                if let Some(stream) = pane.reply.take() {
+                    reply(
+                        stream,
+                        Ok(CommandResult {
+                            code,
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                            terminal_output: std::mem::take(&mut pane.bytes),
+                        }),
+                    );
                 }
+                pane.pty.take();
+                pane.finish(Ok(code));
             }
         }
         Ok(())
@@ -487,6 +494,7 @@ impl Sessions {
             reply: None,
             bytes: Vec::new(),
             eof: false,
+            exited: None,
         };
         let label: String = request.label.chars().filter(|c| !c.is_control()).collect();
         pane.parser
@@ -763,7 +771,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let result = wait_result(&mut sessions, &receiver);
-        assert_eq!(result.code, 7);
+        assert_eq!(
+            result.code,
+            7,
+            "PTY output: {:?}",
+            String::from_utf8_lossy(&result.terminal_output)
+        );
         assert!(result.stdout.is_empty() && result.stderr.is_empty());
         let output = String::from_utf8_lossy(&result.terminal_output);
         assert!(output.contains("ECHO:hello"), "{output}");
