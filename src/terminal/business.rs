@@ -1,7 +1,10 @@
 //! Structured progress emitted by the workflow child; terminal output stays separate.
 use crate::state::{AppState, TARGET_IDS, target_state_flags};
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::OnceLock;
+
+const HISTORY_LIMIT: usize = 500;
 
 static OWNER_PID: OnceLock<u32> = OnceLock::new();
 
@@ -118,6 +121,26 @@ pub fn phase(phase: &'static str) {
     send("phase", phase);
 }
 
+// JSON escapes control characters; escape OSC's field separator as well.
+fn text_payload(text: &str) -> String {
+    let text = text.chars().take(4096).collect::<String>();
+    serde_json::to_string(&text)
+        .unwrap()
+        .replace(';', "\\u003b")
+}
+
+pub fn notice(text: &str) {
+    send("notice", &text_payload(text));
+}
+
+pub fn command_started(label: &str) {
+    send("command", &text_payload(label));
+}
+
+pub fn command_finished(result: &str) {
+    send("command-result", &text_payload(result));
+}
+
 pub fn checked(target: &str, state: &AppState) {
     report(target, check_status(target, state));
 }
@@ -144,6 +167,9 @@ pub struct Progress {
     pub start_time: String,
     pub targets: Vec<(String, Status)>,
     pub phase: &'static str,
+    pub command: Option<String>,
+    pub command_result: Option<String>,
+    pub history: VecDeque<String>,
 }
 
 impl Progress {
@@ -156,6 +182,9 @@ impl Progress {
                 .map(|target| (target.clone(), Status::Waiting))
                 .collect(),
             phase: "启动",
+            command: None,
+            command_result: None,
+            history: VecDeque::new(),
         }
     }
 
@@ -163,6 +192,27 @@ impl Progress {
         let [b"777", b"updt", target, status] = params else {
             return;
         };
+        if matches!(*target, b"notice" | b"command" | b"command-result") {
+            let Ok(text) = serde_json::from_slice::<String>(status) else {
+                return;
+            };
+            let text: String = text
+                .chars()
+                .take(4096)
+                .filter(|c| !c.is_control() || *c == '\n')
+                .collect();
+            if *target == b"command" {
+                self.command = Some(text.replace('\n', " "));
+                self.command_result = None;
+                self.record(&format!("执行  $ {text}"));
+            } else if *target == b"command-result" {
+                self.command_result = Some(text.replace('\n', " "));
+                self.record(&format!("结果  {text}"));
+            } else {
+                self.record(&text);
+            }
+            return;
+        }
         if *target == b"phase" {
             self.phase = match *status {
                 b"checking" => "检查",
@@ -189,7 +239,21 @@ impl Progress {
         }
     }
 
+    fn record(&mut self, text: &str) {
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            // Messages are plain text. Never let control characters affect the UI.
+            self.history
+                .push_back(line.chars().filter(|c| !c.is_control()).collect());
+            if self.history.len() > HISTORY_LIMIT {
+                self.history.pop_front();
+            }
+        }
+    }
+
     pub fn finish(&mut self, code: i32) {
+        if self.command.is_some() && self.command_result.is_none() {
+            self.command_result = Some(format!("流程已退出 · exit {code}"));
+        }
         self.phase = if code == 0 {
             "完成"
         } else {
@@ -223,6 +287,52 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_protocol_handles_chunking_separators_unicode_and_control_characters() {
+        struct Events(Progress);
+        impl vt100::Callbacks for Events {
+            fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+                self.0.apply(params);
+            }
+        }
+        let mut parser = vt100::Parser::new_with_callbacks(
+            10.try_into().unwrap(),
+            40.try_into().unwrap(),
+            0,
+            Events(Progress::new(&[], "windows", "now")),
+        );
+        let message = "中文; quoted \"value\"\nnext\x1b\\\x07";
+        let payload = text_payload(message);
+        assert!(!payload.contains(';'));
+        let bytes = format!("\x1b]777;updt;notice;{payload}\x1b\\visible output");
+        for chunk in bytes.as_bytes().chunks(2) {
+            parser.process(chunk);
+        }
+        assert_eq!(parser.screen().contents(), "visible output");
+        assert_eq!(parser.callbacks().0.history[0], "中文; quoted \"value\"");
+        assert_eq!(parser.callbacks().0.history[1], "next\\");
+    }
+
+    #[test]
+    fn command_results_reset_and_activity_history_is_bounded() {
+        let mut progress = Progress::new(&[], "windows", "now");
+        progress.apply(&[b"777", b"updt", b"command", br#""cargo install-update""#]);
+        progress.apply(&[b"777", b"updt", b"command-result", br#""exit 1""#]);
+        assert_eq!(progress.command_result.as_deref(), Some("exit 1"));
+        progress.apply(&[b"777", b"updt", b"command", br#""npm update -g""#]);
+        assert!(progress.command_result.is_none());
+        for i in 0..HISTORY_LIMIT + 10 {
+            progress.record(&i.to_string());
+        }
+        assert_eq!(progress.history.len(), HISTORY_LIMIT);
+        assert_eq!(progress.history.front().unwrap(), "10");
+        progress.finish(130);
+        assert_eq!(
+            progress.command_result.as_deref(),
+            Some("流程已退出 · exit 130")
+        );
+    }
 
     #[test]
     fn check_results_distinguish_skipped_current_updates_and_failures() {

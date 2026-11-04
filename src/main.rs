@@ -50,7 +50,7 @@ async fn run_app() -> i32 {
         return code;
     }
     if matches!(cli, CliCommand::TerminalDemo) {
-        return terminal::run_demo();
+        return terminal::run_demo().await;
     }
     if let CliCommand::TerminalWorker { owner_pid, .. } = &cli {
         terminal::business::enable_worker(*owner_pid);
@@ -175,6 +175,9 @@ async fn upgrade_exit_code(state: &AppState, selected_targets: &[String]) -> i32
 }
 
 fn print_text_header_if_needed(ctx: &RunContext) {
+    if terminal::business::is_worker() {
+        return;
+    }
     if !interactive_terminal() || ctx.force_text_flow {
         print_section("检查可升级项");
         println!(

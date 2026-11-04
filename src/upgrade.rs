@@ -2,7 +2,10 @@ use crate::command::{
     command_exists, run_capture, run_capture_streaming, run_cargo_install_update_inherit,
     run_inherit,
 };
-use crate::output::{err_text, ok_text, print_section, warn_text};
+// These lines describe workflow decisions; subprocess output stays on stdout.
+use crate::output::{
+    err_text, flow_message as println, ok_text, print_command, print_section, warn_text,
+};
 #[cfg(windows)]
 use crate::parse::strip_ansi_control_sequences;
 use crate::parse::{
@@ -369,7 +372,7 @@ async fn finish_deferred_upgrades(
 }
 
 async fn upgrade_brew() -> bool {
-    println!("[brew] 正在刷新索引: brew update --quiet");
+    print_command("brew update --quiet");
     match run_inherit("brew", &["update", "--quiet"]).await {
         Ok(true) => {}
         _ => {
@@ -378,7 +381,7 @@ async fn upgrade_brew() -> bool {
         }
     }
 
-    println!("[brew] 正在执行: brew upgrade --greedy");
+    print_command("brew upgrade --greedy");
     match run_inherit("brew", &["upgrade", "--greedy"]).await {
         Ok(true) => {
             println!("[brew] 升级完成.");
@@ -393,7 +396,6 @@ async fn upgrade_brew() -> bool {
 
 async fn upgrade_npm() -> bool {
     run_logged_inherit(
-        "npm",
         "npm",
         NPM_UPDATE_ARGS,
         "npm update -g --prefer-online",
@@ -454,10 +456,10 @@ async fn upgrade_cargo_package_targets(targets: &[String]) -> bool {
     for pkg in targets {
         args.push(pkg.as_str());
     }
-    println!(
-        "[cargo] 正在执行: cargo install-update --locked {}",
+    print_command(&format!(
+        "cargo install-update --locked {}",
         targets.join(" ")
-    );
+    ));
     match run_cargo_install_update_inherit(&args).await {
         Ok(true) => {
             println!("[cargo] 其他已安装 crate 升级完成.");
@@ -473,7 +475,6 @@ async fn upgrade_cargo_package_targets(targets: &[String]) -> bool {
 async fn upgrade_rustup() -> bool {
     run_logged_inherit(
         "rustup",
-        "rustup",
         RUSTUP_UPDATE_ARGS,
         "rustup update --no-self-update",
         "[rustup] toolchain 升级完成.",
@@ -486,7 +487,6 @@ async fn upgrade_paru() -> bool {
     notify_paru_password_attention_if_needed().await;
     run_logged_inherit(
         "paru",
-        "paru",
         &["-Sua"],
         "paru -Sua",
         "[paru] AUR 包升级完成.",
@@ -497,7 +497,6 @@ async fn upgrade_paru() -> bool {
 
 async fn upgrade_flatpak() -> bool {
     run_logged_inherit(
-        "flatpak",
         "flatpak",
         &["update"],
         "flatpak update",
@@ -519,7 +518,7 @@ async fn upgrade_dnf(state: &AppState) -> bool {
         println!("[dnf] {reason}");
     }
 
-    println!("[dnf] 正在执行: {privilege_command} dnf upgrade --refresh");
+    print_command(&format!("{privilege_command} dnf upgrade --refresh"));
     match run_inherit(privilege_command, &["dnf", "upgrade", "--refresh"]).await {
         Ok(true) => {
             println!("[dnf] 包升级完成.");
@@ -533,7 +532,7 @@ async fn upgrade_dnf(state: &AppState) -> bool {
 }
 
 async fn upgrade_pkg() -> bool {
-    println!("[pkg] 正在执行: pkg update");
+    print_command("pkg update");
     match run_inherit("pkg", &["update"]).await {
         Ok(true) => {}
         _ => {
@@ -542,7 +541,7 @@ async fn upgrade_pkg() -> bool {
         }
     }
 
-    println!("[pkg] 正在执行: pkg upgrade");
+    print_command("pkg upgrade");
     match run_inherit("pkg", &["upgrade"]).await {
         Ok(true) => {
             println!("[pkg] 包升级完成.");
@@ -557,7 +556,7 @@ async fn upgrade_pkg() -> bool {
 
 #[cfg(not(windows))]
 async fn upgrade_cargo_self(self_pkg: &str) -> bool {
-    println!("[cargo] 正在执行: cargo install-update --locked updt");
+    print_command("cargo install-update --locked updt");
     match run_cargo_install_update_inherit(&[self_pkg]).await {
         Ok(true) => {
             println!("[cargo] updt 自身升级完成.");
@@ -571,14 +570,13 @@ async fn upgrade_cargo_self(self_pkg: &str) -> bool {
 }
 
 async fn run_logged_inherit(
-    prefix: &str,
     program: &str,
     args: &[&str],
     command_label: &str,
     success_message: &str,
     failure_message: &str,
 ) -> bool {
-    println!("[{prefix}] 正在执行: {command_label}");
+    print_command(command_label);
     match run_inherit(program, args).await {
         Ok(true) => {
             println!("{success_message}");
@@ -866,7 +864,7 @@ async fn run_scoop_update_task(task: &ScoopUpdateTask, allow_prompt: bool) -> Sc
 
 async fn run_scoop_update_attempt(task: &ScoopUpdateTask) -> Option<(i32, String)> {
     let args = task.update_args();
-    println!("[scoop] 正在执行: {}", scoop_command_label(&args));
+    print_command(&scoop_command_label(&args));
     match run_scoop_capture(&args).await {
         Ok(result) => Some(result),
         Err(err) => {
@@ -953,7 +951,7 @@ fn print_captured_command_output(output: &str) {
     }
     print!("{output}");
     if !output.ends_with('\n') {
-        println!();
+        std::println!();
     }
 }
 
@@ -1261,7 +1259,7 @@ async fn run_pacman_upgrade(state: &AppState) -> bool {
     if let Some(reason) = reason {
         println!("[pacman] {reason}");
     }
-    println!("[pacman] 正在执行: {privilege_command} pacman -Syu");
+    print_command(&format!("{privilege_command} pacman -Syu"));
     print_pacman_upgrade_result(run_inherit(privilege_command, &["pacman", "-Syu"]).await)
 }
 

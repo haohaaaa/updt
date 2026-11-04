@@ -316,7 +316,7 @@ fn target_status_style(kind: MsgKind) -> Style {
 }
 
 fn render_selection_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
-    let help = Paragraph::new("Up/Down: move, Space: toggle, Enter: confirm, q/Esc: quit")
+    let help = Paragraph::new("↑/↓ 移动 · Space 勾选 · Enter 查看确认 · q/Esc 退出")
         .block(Block::default().title("updt").borders(Borders::ALL));
     frame.render_widget(help, area);
 }
@@ -330,12 +330,17 @@ fn render_upgradable_selection_list(
     let list = List::new(selection_list_items(view, item_indent))
         .block(
             Block::default()
-                .title("选择要升级的项目")
+                .title(format!(
+                    "选择升级目标 · 已选 {}/{}",
+                    view.selected.iter().filter(|v| **v).count(),
+                    view.selected.len()
+                ))
                 .borders(Borders::ALL),
         )
         .highlight_style(
             Style::default()
-                .fg(Color::Yellow)
+                .bg(Color::DarkGray)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(">> ");
@@ -374,7 +379,9 @@ fn selection_target_rows(
     rows.extend(
         updatable_items_for_target(view.state, target)
             .into_iter()
-            .map(|pkg| ListItem::new(format!("{item_indent}{pkg}"))),
+            .map(|pkg| {
+                ListItem::new(format!("{item_indent}{pkg}")).style(Style::default().fg(Color::Gray))
+            }),
     );
     rows
 }

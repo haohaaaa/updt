@@ -156,7 +156,11 @@ The original interface and the embedded terminal interface have separate entry p
 | `updt terminal` | New interface: real target status on the left, checks, confirmation and updates inside the terminal on the right |
 | `updt terminal npm cargo` | New interface for the requested targets; updates the selected targets that have updates |
 
-Without explicit targets, the new interface asks which targets to update in the right-hand terminal. Answer package-manager prompts there as well. Check commands stream their output while retaining separate captured output for parsing. Update order and deferred Windows updates use the same business logic as the original interface.
+Without explicit targets, the new interface asks which targets to update in the right-hand terminal. Answer package-manager prompts in their command session. Each command has its own output view, so parallel checks never interleave output from different commands. The workflow view shows parsed check results, confirmation, and the final summary. Update order and deferred Windows updates use the same business logic as the original interface.
+
+The workflow submits commands through an internal Rust execution API. The UI opens a command session, displays the command, and renders its live output while the caller awaits the result. Capture commands return separate, unchanged stdout/stderr for JSON parsing. Interactive commands run in a native PTY and return the merged terminal output and exit code. Display and API results come from the same execution.
+
+The sidebar lists command sessions; `F5` / `F6` switches between them and the workflow view. Up to 32 completed/running sessions are retained (older completed sessions are evicted first). Each session has its own terminal screen and scrollback. The header shows the selected command and its exit status. Workflow messages remain in the **activity view** (`F2`, up to 500 lines). See [the internal execution API](docs/terminal-execution.md) for implementation details.
 
 On Windows, deferred `rustup` and `updt` updates wait for the **outer terminal interface** to exit, so its executable no longer holds the installation directory open. Once the workflow finishes, press Enter or Esc to close the interface and allow those updates to run.
 
@@ -167,14 +171,17 @@ updt terminal --demo
 updt terminal --shell
 ```
 
-`--demo` runs a small color/progress/input demonstration without executing package-manager commands. `--shell` opens PowerShell on Windows or `$SHELL` (falling back to `/bin/sh`) on Unix without starting the update workflow. Commands you type run in that shell.
+`--demo` runs two harmless commands through the execution API: one produces JSON and stderr, and one asks for text input in a real PTY. The demo verifies the captured JSON and shows the interactive command's returned exit code and output size. It does not execute package-manager commands. `--shell` opens PowerShell on Windows or `$SHELL` (falling back to `/bin/sh`) on Unix without starting the update workflow. Commands you type run in that shell.
 
 - Type directly in the terminal; `Ctrl+C` is forwarded to the child terminal.
-- Use `Shift+PageUp` / `Shift+PageDown` to review output. Typing returns to live output.
+- Use `F2` to switch between terminal output and the read-only activity view in the update workflow.
+- Use `F5` / `F6` to switch to the previous/next command session or workflow view. Manually selecting a session stops automatic focus changes.
+- Use `Shift+PageUp` / `Shift+PageDown` to review output or activity history.
+- Use `F4` to return to the active interactive command (or workflow when none is running) and resume automatic focus. Query sessions and completed commands are read-only. Keyboard input and paste are paused while browsing history, so they cannot accidentally answer a hidden prompt.
 - Use `exit` to end the shell, then `Enter` or `Esc` to return.
 - `F10` asks for confirmation before ending a running terminal; it closes a finished terminal immediately.
 
-The new interface currently has one shared terminal pane; the sidebar shows status rather than selecting individual terminal sessions. Mouse forwarding and full compatibility with arbitrary terminal applications are not yet validated.
+Command sessions run separate processes; working-directory changes and shell variables do not persist between commands. Use `--shell` for a persistent interactive shell. Mouse forwarding and full compatibility with arbitrary terminal applications are not yet validated.
 
 Show the installed version:
 

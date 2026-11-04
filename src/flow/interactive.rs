@@ -242,7 +242,7 @@ pub async fn offer_install_cargo_update(state: &mut AppState) {
         return;
     }
 
-    println!("[cargo] 正在执行: cargo install cargo-update");
+    crate::output::print_command("cargo install cargo-update");
     let install_result = run_inherit("cargo", &["install", "cargo-update"]).await;
     handle_cargo_update_install_text_result(state, install_result).await;
 }
@@ -259,7 +259,7 @@ pub async fn offer_install_cargo_binstall(state: &AppState) {
         return;
     }
 
-    println!("[cargo] 正在执行: cargo install cargo-binstall");
+    crate::output::print_command("cargo install cargo-binstall");
     match run_inherit("cargo", &["install", "cargo-binstall"]).await {
         Ok(true) => println!("[cargo] cargo-binstall 安装完成."),
         _ => println!("{}", err_text("[cargo] cargo-binstall 安装失败.")),

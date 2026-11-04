@@ -151,3 +151,85 @@ fn validation_modes_cannot_be_combined_with_update_targets() {
         assert_eq!(output.status.code(), Some(2), "{output:?}");
     }
 }
+
+#[test]
+fn terminal_demo_executes_via_internal_api_routes_input_and_switches_sessions() {
+    let pair = portable_pty::native_pty_system()
+        .openpty(PtySize {
+            rows: 32,
+            cols: 130,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_updt"));
+    command.args(["terminal", "--demo"]);
+    command.env("TERM", "xterm-256color");
+    let mut child = ChildGuard(pair.slave.spawn_command(command).unwrap());
+    drop(pair.slave);
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = [0; 8192];
+        while let Ok(count) = reader.read(&mut bytes) {
+            if count == 0 {
+                break;
+            }
+            let _ = sender.send(bytes[..count].to_vec());
+        }
+    });
+    let mut parser = vt100::Parser::new_with_callbacks(
+        32.try_into().unwrap(),
+        130.try_into().unwrap(),
+        100,
+        Events::default(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut answered = false;
+    let mut switched = false;
+    let mut exited = false;
+    loop {
+        if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(20)) {
+            parser.process(&bytes);
+        }
+        let replies = std::mem::take(&mut parser.callbacks_mut().1);
+        if !replies.is_empty() {
+            writer.write_all(&replies).unwrap();
+            writer.flush().unwrap();
+        }
+        let screen = parser.screen().contents();
+        if !answered && screen.contains("输入任意文字后按 Enter") {
+            writer.write_all(b"hello\r").unwrap();
+            writer.flush().unwrap();
+            answered = true;
+        }
+        if answered
+            && !switched
+            && screen.contains("内部 API 收到交互命令结果")
+            && screen.contains("终端已退出")
+        {
+            writer.write_all(b"\x1b[15~").unwrap(); // F5: last command session
+            writer.flush().unwrap();
+            switched = true;
+        }
+        if switched && !exited && screen.contains("收到: hello") && screen.contains("命令输出")
+        {
+            writer.write_all(b"\x1b[17~\r").unwrap(); // F6: workflow; Enter: exit
+            writer.flush().unwrap();
+            exited = true;
+        }
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert_eq!(status.exit_code(), 0, "{screen}");
+            assert!(
+                answered && switched && exited,
+                "demo exited early: {screen}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "demo timed out: answered={answered}, switched={switched}, exited={exited}\n{screen}"
+        );
+    }
+}

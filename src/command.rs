@@ -77,7 +77,7 @@ async fn command_program(program: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(program))
 }
 
-async fn command(program: &str) -> Command {
+pub(crate) async fn command(program: &str) -> Command {
     let program_path = command_program(program).await;
     #[cfg(windows)]
     {
@@ -112,9 +112,17 @@ async fn is_executable(path: &Path) -> bool {
 }
 
 pub async fn run_output(program: &str, args: &[&str]) -> io::Result<Output> {
-    if crate::terminal::business::is_worker() {
-        return run_output_streaming(program, args, false).await;
+    if crate::terminal::execution::available() {
+        return crate::terminal::execution::execute(
+            program,
+            args,
+            crate::terminal::execution::Mode::Capture,
+        )
+        .await
+        .map(crate::terminal::execution::CommandResult::into_output);
     }
+    // Captured queries include JSON and run concurrently. Display their parsed
+    // check results, rather than mixing machine output into the live terminal.
     command(program).await.args(args).output().await
 }
 
@@ -128,6 +136,18 @@ pub async fn run_capture(program: &str, args: &[&str]) -> io::Result<(i32, Strin
 }
 
 pub async fn run_capture_streaming(program: &str, args: &[&str]) -> io::Result<(i32, String)> {
+    if crate::terminal::execution::available() {
+        let result = crate::terminal::execution::execute(
+            program,
+            args,
+            crate::terminal::execution::Mode::Interactive,
+        )
+        .await?;
+        return Ok((
+            result.code,
+            String::from_utf8_lossy(&result.terminal_output).into_owned(),
+        ));
+    }
     let output =
         run_output_streaming(program, args, crate::terminal::business::is_worker()).await?;
     let text = format!(
@@ -143,7 +163,7 @@ async fn run_output_streaming(
     args: &[&str],
     inherit_input: bool,
 ) -> io::Result<Output> {
-    print_worker_command(program, args);
+    let mut display = CommandDisplay::start(program, args);
     let mut child = command(program)
         .await
         .args(args)
@@ -170,6 +190,7 @@ async fn run_output_streaming(
     let status = child.wait().await?;
     let stdout = join_stream_reader(stdout_task).await?;
     let stderr = join_stream_reader(stderr_task).await?;
+    display.finish(status.code());
     Ok(Output {
         status,
         stdout,
@@ -212,7 +233,16 @@ async fn join_stream_reader(
 }
 
 pub async fn run_inherit(program: &str, args: &[&str]) -> io::Result<bool> {
-    print_worker_command(program, args);
+    if crate::terminal::execution::available() {
+        return crate::terminal::execution::execute(
+            program,
+            args,
+            crate::terminal::execution::Mode::Interactive,
+        )
+        .await
+        .map(|result| result.code == 0);
+    }
+    let mut display = CommandDisplay::start(program, args);
     let status = command(program)
         .await
         .args(args)
@@ -221,23 +251,45 @@ pub async fn run_inherit(program: &str, args: &[&str]) -> io::Result<bool> {
         .stderr(Stdio::inherit())
         .status()
         .await?;
+    display.finish(status.code());
     Ok(status.success())
 }
 
-fn print_worker_command(program: &str, args: &[&str]) {
-    if !crate::terminal::business::is_worker() {
-        return;
+struct CommandDisplay(bool);
+
+impl CommandDisplay {
+    fn start(program: &str, args: &[&str]) -> Self {
+        if crate::terminal::business::is_worker() {
+            crate::terminal::business::command_started(&command_label(program, args));
+        }
+        Self(false)
     }
+
+    fn finish(&mut self, code: Option<i32>) {
+        self.0 = true;
+        crate::terminal::business::command_finished(&match code {
+            Some(0) => "完成 · exit 0".to_string(),
+            Some(code) => format!("失败 · exit {code}"),
+            None => "已被信号中断".to_string(),
+        });
+    }
+}
+
+impl Drop for CommandDisplay {
+    fn drop(&mut self) {
+        if !self.0 {
+            crate::terminal::business::command_finished("启动失败或输出读取失败");
+        }
+    }
+}
+
+pub(crate) fn command_label(program: &str, args: &[&str]) -> String {
     let script = args
         .iter()
         .position(|arg| arg.eq_ignore_ascii_case("-Command"));
     let args = args[..script.unwrap_or(args.len())].join(" ");
     let label = format!("{program} {args}");
-    let short = label.chars().take(180).collect::<String>();
-    println!(
-        "\n$ {short}{}",
-        if script.is_some() { " [script]" } else { "" }
-    );
+    format!("{label}{}", if script.is_some() { " [script]" } else { "" })
 }
 
 pub async fn run_cargo_install_update_capture(args: &[&str]) -> io::Result<(i32, String)> {

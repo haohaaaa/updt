@@ -1,5 +1,6 @@
 //! Opt-in PTY UI. The legacy interface stays independent of this entry point.
 pub mod business;
+pub mod execution;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -15,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 use std::{
     io::{self, Read, Write},
@@ -48,7 +49,7 @@ struct PtySession {
     // draining without blocking on a full channel during console teardown.
     events: Option<Receiver<PtyEvent>>,
     writer: Option<Box<dyn Write + Send>>,
-    master: Box<dyn MasterPty + Send>,
+    master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -98,7 +99,7 @@ impl PtySession {
         Ok(Self {
             events: Some(receiver),
             writer: Some(writer),
-            master: pair.master,
+            master: Some(pair.master),
             child,
         })
     }
@@ -109,6 +110,22 @@ impl PtySession {
             writer.flush()?;
         }
         Ok(())
+    }
+
+    fn resize(&self, size: PtySize) -> io::Result<()> {
+        if let Some(master) = &self.master {
+            master.resize(size).map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    fn close_output(&mut self) {
+        self.writer.take();
+        if let Some(master) = self.master.take() {
+            // ConPTY may flush output while closing. Keep draining its reader
+            // on the UI thread while this close waits in the background.
+            std::thread::spawn(move || drop(master));
+        }
     }
 }
 
@@ -209,8 +226,16 @@ fn regions(area: Rect) -> (Rect, Rect, Rect) {
     (columns[0], columns[1], vertical[1])
 }
 
-fn pty_size(area: Rect) -> PtySize {
+fn content_regions(pane: Rect, workflow: bool) -> (Rect, Rect) {
+    let header_height = if workflow && pane.height >= 8 { 4 } else { 0 };
+    let parts =
+        Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).split(pane);
+    (parts[0], parts[1])
+}
+
+fn pty_size(area: Rect, workflow: bool) -> PtySize {
     let (_, pane, _) = regions(area);
+    let (_, pane) = content_regions(pane, workflow);
     PtySize {
         rows: pane.height.saturating_sub(2).max(1),
         cols: pane.width.saturating_sub(2).max(1),
@@ -231,7 +256,14 @@ pub fn run(shell: &str, demo: bool) -> io::Result<i32> {
         }
         command
     };
-    run_session(command, if demo { "交互演示" } else { shell }, None)
+    let progress = demo.then(|| {
+        business::Progress::new(
+            &[],
+            "演示",
+            &chrono::Local::now().format("%H:%M:%S").to_string(),
+        )
+    });
+    run_session(command, if demo { "交互演示" } else { shell }, progress)
 }
 
 pub fn run_workflow(targets: &[String], progress: business::Progress) -> io::Result<i32> {
@@ -256,7 +288,17 @@ fn run_session(
     let _guard = TerminalMode::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let (width, height) = crossterm::terminal::size()?;
-    let mut size = pty_size(Rect::new(0, 0, width, height));
+    let workflow = progress.is_some();
+    let mut sessions = if workflow {
+        Some(execution::Sessions::new()?)
+    } else {
+        None
+    };
+    if let Some(sessions) = &sessions {
+        sessions.configure(&mut command);
+    }
+    let mut view = View::default();
+    let mut size = pty_size(Rect::new(0, 0, width, height), workflow);
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     command.cwd(std::env::current_dir()?);
@@ -271,37 +313,102 @@ fn run_session(
         },
     );
     let mut exit_code = None;
+    let mut worker_status = None;
+    let mut worker_eof = false;
     let mut confirm_exit = false;
+    let mut rendered_view = None;
     loop {
         for _ in 0..64 {
             match session.events.as_ref().unwrap().try_recv() {
-                Ok(PtyEvent::Output(bytes)) => parser.process(&bytes),
+                Ok(PtyEvent::Output(bytes)) => {
+                    let before = parser.screen().contents();
+                    parser.process(&bytes);
+                    if view.follow
+                        && before != parser.screen().contents()
+                        && let Some(sessions) = &mut sessions
+                    {
+                        sessions.active = None;
+                    }
+                }
                 Ok(PtyEvent::Error(err)) => return Err(err),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Disconnected) => {
+                    worker_eof = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
             }
         }
+        if let Some(sessions) = &mut sessions {
+            sessions.poll(size, view.follow)?;
+        }
         let responses = std::mem::take(&mut parser.callbacks_mut().bytes);
-        if !responses.is_empty() && exit_code.is_none() {
+        if !responses.is_empty() && worker_status.is_none() {
             session.write(&responses)?;
         }
-        if exit_code.is_none() {
-            exit_code = session
+        if worker_status.is_none() {
+            worker_status = session
                 .child
                 .try_wait()?
                 .map(|status| status.exit_code() as i32);
+            if worker_status.is_some() {
+                session.close_output();
+            }
+        }
+        if exit_code.is_none() && worker_eof {
+            exit_code = worker_status;
             if let (Some(code), Some(progress)) = (exit_code, &mut parser.callbacks_mut().progress)
             {
                 progress.finish(code);
             }
         }
+        let active = sessions.as_ref().and_then(execution::Sessions::active);
+        view.session = active.map(|pane| SessionView {
+            label: format!("#{} {}", pane.id, pane.label),
+            code: pane.code,
+            interactive: pane.accepts_input(),
+        });
+        if let Some(sessions) = &sessions {
+            view.session_list = std::iter::once("流程 · 确认与汇总".to_string())
+                .chain(sessions.panes.iter().map(|pane| {
+                    format!(
+                        "#{} {} {}",
+                        pane.id,
+                        if pane.code.is_some() {
+                            "完成"
+                        } else {
+                            "运行"
+                        },
+                        pane.label
+                    )
+                }))
+                .collect();
+            view.selected_session = sessions
+                .panes
+                .iter()
+                .position(|pane| Some(pane.id) == sessions.active)
+                .map_or(0, |i| i + 1);
+        }
+        let current_view = (
+            sessions.as_ref().and_then(|sessions| sessions.active),
+            view.history,
+            exit_code,
+            view.session.as_ref().and_then(|session| session.code),
+        );
+        if rendered_view != Some(current_view) {
+            // ConPTY can retain cells beside wide characters when unrelated
+            // terminal screens are diffed. Switching screens needs a full redraw.
+            terminal.clear()?;
+            rendered_view = Some(current_view);
+        }
         terminal.draw(|frame| {
             render(
                 frame,
-                parser.screen(),
+                active.map_or_else(|| parser.screen(), |pane| pane.parser.screen()),
                 label,
                 exit_code,
                 confirm_exit,
                 parser.callbacks().progress.as_ref(),
+                &view,
             )
         })?;
         if !event::poll(Duration::from_millis(30))? {
@@ -309,19 +416,26 @@ fn run_session(
         }
         match event::read()? {
             Event::Resize(width, height) => {
-                size = pty_size(Rect::new(0, 0, width, height));
-                session.master.resize(size).map_err(io::Error::other)?;
+                size = pty_size(Rect::new(0, 0, width, height), workflow);
+                session.resize(size)?;
+                if let Some(sessions) = &mut sessions {
+                    sessions.resize(size)?;
+                }
                 parser.set_size(nonzero(size.rows), nonzero(size.cols));
             }
-            Event::Paste(text) if exit_code.is_none() && !confirm_exit => {
-                parser.screen_mut().set_scrollback(0);
-                if parser.screen().bracketed_paste() {
-                    session.write(b"\x1b[200~")?;
-                }
-                session.write(text.as_bytes())?;
-                if parser.screen().bracketed_paste() {
-                    session.write(b"\x1b[201~")?;
-                }
+            Event::Paste(text)
+                if exit_code.is_none()
+                    && !confirm_exit
+                    && !view.history
+                    && active_screen(&parser, &sessions).scrollback() == 0 =>
+            {
+                let paste = active_screen(&parser, &sessions).bracketed_paste();
+                let bytes = if paste {
+                    format!("\x1b[200~{text}\x1b[201~").into_bytes()
+                } else {
+                    text.into_bytes()
+                };
+                write_active(&mut session, &mut sessions, &bytes)?;
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if confirm_exit {
@@ -330,6 +444,26 @@ fn run_session(
                         KeyCode::Esc | KeyCode::Char('n' | 'N') => confirm_exit = false,
                         _ => {}
                     }
+                } else if workflow && key.code == KeyCode::F(2) {
+                    view.history = !view.history;
+                    view.follow = !view.history;
+                } else if workflow && matches!(key.code, KeyCode::F(5) | KeyCode::F(6)) {
+                    view.history = false;
+                    view.follow = false;
+                    if let Some(sessions) = &mut sessions {
+                        sessions.cycle(key.code == KeyCode::F(6));
+                    }
+                } else if key.code == KeyCode::F(4) {
+                    view = View::default();
+                    if let Some(sessions) = &mut sessions {
+                        sessions.live();
+                        if let Some(pane) = sessions.active_mut() {
+                            pane.parser.screen_mut().set_scrollback(0);
+                        }
+                    }
+                    parser.screen_mut().set_scrollback(0);
+                } else if view.history && key.code == KeyCode::Esc {
+                    view.history = false;
                 } else if key.code == KeyCode::F(10) {
                     if let Some(code) = exit_code {
                         return Ok(code);
@@ -338,24 +472,77 @@ fn run_session(
                 } else if key.modifiers.contains(KeyModifiers::SHIFT)
                     && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
                 {
-                    let offset = parser.screen().scrollback();
+                    let offset = if view.history {
+                        view.offset
+                    } else {
+                        active_screen(&parser, &sessions).scrollback()
+                    };
                     let offset = if key.code == KeyCode::PageUp {
                         offset.saturating_add(usize::from(size.rows))
                     } else {
                         offset.saturating_sub(usize::from(size.rows))
                     };
-                    parser.screen_mut().set_scrollback(offset);
+                    if view.history {
+                        let count = parser
+                            .callbacks()
+                            .progress
+                            .as_ref()
+                            .map_or(0, |p| history_lines(p, size.cols).len());
+                        view.offset = offset.min(count.saturating_sub(usize::from(size.rows)));
+                    } else {
+                        view.follow = offset == 0;
+                        if let Some(pane) =
+                            sessions.as_mut().and_then(execution::Sessions::active_mut)
+                        {
+                            pane.parser.screen_mut().set_scrollback(offset);
+                        } else {
+                            parser.screen_mut().set_scrollback(offset);
+                        }
+                    }
+                } else if view.history || active_screen(&parser, &sessions).scrollback() > 0 {
+                    // Browsing is read-only: never send an unseen answer to a prompt.
                 } else if let Some(code) = exit_code {
                     if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
                         return Ok(code);
                     }
                 } else {
                     parser.screen_mut().set_scrollback(0);
-                    session.write(&encode_key(key, parser.screen().application_cursor()))?;
+                    let bytes =
+                        encode_key(key, active_screen(&parser, &sessions).application_cursor());
+                    write_active(&mut session, &mut sessions, &bytes)?;
                 }
             }
             _ => {}
         }
+    }
+}
+
+fn active_screen<'a>(
+    parser: &'a vt100::Parser<Responses>,
+    sessions: &'a Option<execution::Sessions>,
+) -> &'a vt100::Screen {
+    sessions
+        .as_ref()
+        .and_then(execution::Sessions::active)
+        .map_or_else(|| parser.screen(), |pane| pane.parser.screen())
+}
+
+fn write_active(
+    session: &mut PtySession,
+    sessions: &mut Option<execution::Sessions>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    if let Some(pane) = sessions.as_mut().and_then(execution::Sessions::active_mut) {
+        pane.write(bytes)
+    } else if sessions
+        .as_ref()
+        .is_some_and(|sessions| sessions.panes.iter().any(|pane| pane.code.is_none()))
+    {
+        // The workflow is waiting for another pane. Do not queue keystrokes
+        // there that could accidentally answer its next prompt.
+        Ok(())
+    } else {
+        session.write(bytes)
     }
 }
 
@@ -429,6 +616,53 @@ fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
     bytes
 }
 
+struct View {
+    history: bool,
+    offset: usize,
+    follow: bool,
+    session: Option<SessionView>,
+    session_list: Vec<String>,
+    selected_session: usize,
+}
+
+struct SessionView {
+    label: String,
+    code: Option<i32>,
+    interactive: bool,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            history: false,
+            offset: 0,
+            follow: true,
+            session: None,
+            session_list: Vec::new(),
+            selected_session: 0,
+        }
+    }
+}
+
+fn history_lines(progress: &business::Progress, width: u16) -> Vec<String> {
+    let mut lines = Vec::new();
+    for record in &progress.history {
+        let mut line = String::new();
+        let mut columns = 0;
+        for ch in record.chars() {
+            let char_width = Span::raw(ch.to_string()).width();
+            if columns + char_width > usize::from(width.max(1)) && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                columns = 0;
+            }
+            line.push(ch);
+            columns += char_width;
+        }
+        lines.push(line);
+    }
+    lines
+}
+
 fn render(
     frame: &mut ratatui::Frame<'_>,
     screen: &vt100::Screen,
@@ -436,6 +670,7 @@ fn render(
     exit_code: Option<i32>,
     confirm_exit: bool,
     progress: Option<&business::Progress>,
+    view: &View,
 ) {
     let (sidebar, pane, footer) = regions(frame.area());
     if sidebar.width > 0 {
@@ -445,12 +680,8 @@ fn render(
             .split(sidebar);
         let header = if let Some(progress) = progress {
             format!(
-                "开始: {}\n策略: {}\n阶段: {}\n终端: {} × {}",
-                progress.start_time,
-                progress.profile,
-                progress.phase,
-                screen.size().1,
-                screen.size().0
+                "开始: {}\n策略: {}\n阶段: {}\nF2: 输出 / 流程记录",
+                progress.start_time, progress.profile, progress.phase,
             )
         } else {
             format!(
@@ -493,6 +724,14 @@ fn render(
                 .into_iter()
                 .collect()
         };
+        let notice_height = if progress.is_some() && left[1].height >= 12 {
+            6
+        } else {
+            0
+        };
+        let target_areas =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(notice_height)])
+                .split(left[1]);
         frame.render_widget(
             List::new(targets).block(
                 Block::default()
@@ -503,42 +742,154 @@ fn render(
                     })
                     .borders(Borders::ALL),
             ),
-            left[1],
+            target_areas[0],
+        );
+        if !view.session_list.is_empty() {
+            let list = List::new(
+                view.session_list
+                    .iter()
+                    .map(|line| ListItem::new(line.as_str())),
+            )
+            .block(Block::bordered().title("会话 · F5/F6 切换"))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
+            let mut selected =
+                ratatui::widgets::ListState::default().with_selected(Some(view.selected_session));
+            frame.render_stateful_widget(list, target_areas[1], &mut selected);
+        } else if let Some(progress) = progress {
+            frame.render_widget(
+                Paragraph::new(
+                    progress
+                        .history
+                        .back()
+                        .map_or("等待检查结果", String::as_str),
+                )
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("最新消息 · F2 查看记录")),
+                target_areas[1],
+            );
+        }
+    }
+    let (command_area, pane) = content_regions(pane, progress.is_some());
+    if let Some(progress) = progress {
+        let command = view
+            .session
+            .as_ref()
+            .map(|session| session.label.as_str())
+            .unwrap_or(match progress.phase {
+                "检查" => "并行检查中 · 完成后显示检查结果",
+                "确认" => "请在下方终端确认升级目标",
+                "完成" | "中断或失败" => "本次流程已结束",
+                _ => "流程确认与汇总",
+            });
+        let state = view.session.as_ref().map_or_else(
+            || progress.phase.to_string(),
+            |session| {
+                session.code.map_or_else(
+                    || {
+                        if session.interactive {
+                            "运行中 · 可直接输入"
+                        } else {
+                            "查询中 · 输出可供业务解析"
+                        }
+                        .to_string()
+                    },
+                    |code| format!("已结束 · exit {code}"),
+                )
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(command.to_string(), Style::default().fg(Color::Cyan)),
+                Line::from(state),
+            ])
+            .block(Block::bordered().title("终端会话 · F5 上一个 / F6 下一个")),
+            command_area,
         );
     }
-    let title = exit_code.map_or_else(
-        || "命令终端 · 输入直接发送".to_string(),
-        |code| format!("终端已退出 · exit {code}"),
-    );
+    let title = if view.history {
+        "流程记录 · 只读 · F2 返回输出".to_string()
+    } else if screen.scrollback() > 0 {
+        format!("历史输出 · 上方 {} 行 · F4 返回实时", screen.scrollback())
+    } else if let Some(session) = &view.session {
+        if let Some(code) = session.code {
+            format!("命令输出 · exit {code} · 只读")
+        } else if session.interactive {
+            "命令输出 · 输入直接发送".to_string()
+        } else {
+            "查询输出 · 只读".to_string()
+        }
+    } else {
+        exit_code.map_or_else(
+            || {
+                if progress.is_some_and(|p| p.phase == "检查") {
+                    "检查结果 · 正在检查，进度见左侧".to_string()
+                } else {
+                    "终端输出 · 可直接输入".to_string()
+                }
+            },
+            |code| format!("终端已退出 · exit {code}"),
+        )
+    };
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(pane);
     frame.render_widget(block, pane);
-    let lines = (0..inner.height)
-        .map(|row| {
-            let spans = (0..inner.width)
-                .filter_map(|col| {
-                    let cell = screen.cell(row, col)?;
-                    if cell.is_wide_continuation() {
-                        return None;
-                    }
-                    Some(Span::styled(
-                        if cell.has_contents() {
-                            cell.contents()
-                        } else {
-                            " "
-                        },
-                        cell_style(cell),
-                    ))
-                })
+    if view.history {
+        if let Some(progress) = progress {
+            let lines = history_lines(progress, inner.width);
+            let start = lines
+                .len()
+                .saturating_sub(usize::from(inner.height))
+                .saturating_sub(view.offset);
+            let lines = lines
+                .into_iter()
+                .skip(start)
+                .take(usize::from(inner.height))
+                .map(Line::from)
                 .collect::<Vec<_>>();
-            Line::from(spans)
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines), inner);
-    if exit_code.is_none() && !confirm_exit && screen.scrollback() == 0 && !screen.hide_cursor() {
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+    } else {
+        let lines = (0..inner.height)
+            .map(|row| {
+                let spans = (0..inner.width)
+                    .filter_map(|col| {
+                        let cell = screen.cell(row, col)?;
+                        if cell.is_wide_continuation() {
+                            return None;
+                        }
+                        Some(Span::styled(
+                            if cell.has_contents() {
+                                cell.contents()
+                            } else {
+                                " "
+                            },
+                            cell_style(cell),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                Line::from(spans)
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+    if !view.history
+        && view
+            .session
+            .as_ref()
+            .is_none_or(|session| session.interactive)
+        && exit_code.is_none()
+        && !confirm_exit
+        && screen.scrollback() == 0
+        && !screen.hide_cursor()
+    {
         let (row, col) = screen.cursor_position();
         if row < inner.height && col < inner.width {
             frame.set_cursor_position((inner.x + col, inner.y + row));
@@ -546,6 +897,8 @@ fn render(
     }
     let help = if confirm_exit {
         "结束当前终端进程并退出？ Y: 确认  N/Esc: 返回"
+    } else if view.history || screen.scrollback() > 0 {
+        "只读回看 · Shift+PgUp/PgDn: 翻页 · F4: 返回实时 · F10: 退出"
     } else if exit_code.is_some() && progress.is_some_and(business::Progress::has_deferred) {
         "Enter/Esc: 退出并执行收尾更新 · Shift+PgUp/PgDn: 回看输出"
     } else if exit_code.is_some() {
@@ -554,7 +907,15 @@ fn render(
         "Ctrl+C: 发送中断 · Shift+PgUp/PgDn: 回看输出 · F10: 退出"
     };
     frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(if confirm_exit {
+        Paragraph::new(format!(
+            "{help}\n{}",
+            if progress.is_some() {
+                "F2: 流程记录 · F4: 当前交互 · F5/F6: 切换命令会话"
+            } else {
+                "F4: 返回实时输入 · 回看时暂停键盘输入"
+            }
+        ))
+        .style(Style::default().fg(if confirm_exit {
             Color::Yellow
         } else {
             Color::DarkGray
@@ -597,7 +958,17 @@ fn cell_style(cell: &vt100::Cell) -> Style {
     style
 }
 
-pub fn run_demo() -> i32 {
+pub async fn run_demo() -> i32 {
+    if execution::configured() {
+        business::enable_worker(std::process::id());
+        return match execution::run_demo().await {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("终端接口演示失败: {err}");
+                1
+            }
+        };
+    }
     println!("\x1b[1;36mupdt · Embedded terminal MVP\x1b[0m\r");
     println!("这是终端验证演示，不运行包管理器。\r");
     println!("\x1b[32m颜色输出 OK\x1b[0m  中文 / Unicode: 你好，终端！\r");
@@ -622,6 +993,71 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use std::time::Instant;
+
+    #[test]
+    fn workflow_layout_keeps_commands_messages_and_pty_output_separate() {
+        let mut progress = business::Progress::new(&["npm".into()], "windows", "now");
+        progress.apply(&[b"777", b"updt", b"command", br#""npm update -g""#]);
+        progress.apply(&[b"777", b"updt", b"notice", br#""workflow message""#]);
+        let mut parser = vt100::Parser::new(nonzero(20), nonzero(68), 10);
+        parser.process(b"package output\r\nContinue? [y/n]");
+        for (width, height) in [(1, 1), (20, 4), (50, 12), (100, 24)] {
+            for history in [false, true] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render(
+                            frame,
+                            parser.screen(),
+                            "workflow",
+                            None,
+                            false,
+                            Some(&progress),
+                            &View {
+                                history,
+                                offset: 0,
+                                session: Some(SessionView {
+                                    label: "npm update -g".into(),
+                                    code: None,
+                                    interactive: true,
+                                }),
+                                ..View::default()
+                            },
+                        )
+                    })
+                    .unwrap();
+                let size = pty_size(Rect::new(0, 0, width, height), true);
+                assert!(size.rows > 0 && size.cols > 0);
+                if width == 100 {
+                    let buffer = terminal.backend().buffer();
+                    let row = |y| {
+                        (31..99)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    };
+                    assert!(row(1).contains("npm update -g"));
+                    let content = (5..21).map(row).collect::<String>();
+                    assert_eq!(content.contains("package output"), !history);
+                    assert_eq!(content.contains("workflow message"), history);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn activity_wraps_long_commands_and_chinese_without_losing_text() {
+        let mut progress = business::Progress::new(&[], "windows", "now");
+        progress
+            .history
+            .push_back("中文 command --long-argument".into());
+        let lines = history_lines(&progress, 8);
+        assert_eq!(lines.concat(), "中文 command --long-argument");
+        assert!(
+            lines
+                .iter()
+                .all(|line| Line::from(line.as_str()).width() <= 8)
+        );
+    }
 
     #[test]
     fn structured_status_survives_chunked_terminal_output_and_stays_off_screen() {
@@ -653,12 +1089,13 @@ mod tests {
                     None,
                     false,
                     parser.callbacks().progress.as_ref(),
+                    &View::default(),
                 )
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(1, 8)].symbol(), "n");
-        assert_eq!(buffer[(31, 1)].symbol(), "c");
+        assert_eq!(buffer[(31, 5)].symbol(), "c");
     }
 
     #[test]
@@ -700,7 +1137,17 @@ mod tests {
         parser.process("\x1b[32m绿色\x1b[0m\r\nprogress 1%\r\x1b[2Kprogress 100%".as_bytes());
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
-            .draw(|frame| render(frame, parser.screen(), "test shell", None, false, None))
+            .draw(|frame| {
+                render(
+                    frame,
+                    parser.screen(),
+                    "test shell",
+                    None,
+                    false,
+                    None,
+                    &View::default(),
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(31, 1)].symbol(), "绿");
@@ -719,9 +1166,19 @@ mod tests {
         for (width, height) in [(1, 1), (20, 4), (50, 12), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| render(frame, parser.screen(), "shell", None, false, None))
+                .draw(|frame| {
+                    render(
+                        frame,
+                        parser.screen(),
+                        "shell",
+                        None,
+                        false,
+                        None,
+                        &View::default(),
+                    )
+                })
                 .unwrap();
-            let size = pty_size(Rect::new(0, 0, width, height));
+            let size = pty_size(Rect::new(0, 0, width, height), false);
             assert!(size.rows > 0 && size.cols > 0);
         }
     }
@@ -785,7 +1242,7 @@ mod tests {
                     pixel_width: 0,
                     pixel_height: 0,
                 };
-                session.master.resize(size).unwrap();
+                session.resize(size).unwrap();
                 parser.set_size(nonzero(16), nonzero(100));
                 session.write(b"hello\r").unwrap();
                 sent = true;

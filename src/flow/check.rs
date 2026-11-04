@@ -104,6 +104,9 @@ pub async fn run_checks_plain(state: &mut AppState, targets: &[String]) {
 }
 
 fn print_check_header(targets: &[String]) {
+    if crate::terminal::business::is_worker() {
+        return;
+    }
     println!(
         "{} {}",
         color_bold("[check]", TermColor::Yellow),
@@ -122,6 +125,9 @@ async fn print_check_events(rx: &mut mpsc::UnboundedReceiver<CheckEvent>) {
 }
 
 fn print_check_event(line: CheckEvent) {
+    if crate::terminal::business::is_worker() {
+        return;
+    }
     match line {
         CheckEvent::Started(target) => {
             println!("{}", log_pkg_line(&target, "开始检查...", MsgKind::Info));
@@ -141,7 +147,11 @@ fn print_check_event(line: CheckEvent) {
 
 fn print_check_logs(targets: &[String], logs_map: &HashMap<String, Vec<String>>) {
     for target in targets {
-        print_section(section_title(target));
+        if crate::terminal::business::is_worker() {
+            println!("\n── {} · 检查结果 ──", section_title(target));
+        } else {
+            print_section(section_title(target));
+        }
         if let Some(lines) = logs_map.get(target) {
             print_lines(lines);
         }
