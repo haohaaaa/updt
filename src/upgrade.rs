@@ -31,13 +31,13 @@ pub async fn upgrade_selected(state: &AppState, selected: &[String]) -> bool {
     let self_pkg = env!("CARGO_PKG_NAME");
     let pacman_plan = PacmanUpgradePlan::from_selected(state, selected);
 
-    if !run_pacman_before_standard_targets(state, pacman_plan).await {
+    if !run_pacman_before_standard_targets(pacman_plan).await {
         failures.record_target("pacman");
     }
     let mut standard_outcome =
         run_selected_standard_targets(PRE_PACMAN_STANDARD_TARGETS, state, selected, self_pkg).await;
     failures.merge(standard_outcome.failures.clone());
-    if !run_pacman_after_standard_targets(state, pacman_plan).await {
+    if !run_pacman_after_standard_targets(pacman_plan).await {
         failures.record_target("pacman");
     }
     let post_pacman_outcome =
@@ -101,22 +101,18 @@ impl PacmanUpgradePlan {
     }
 }
 
-async fn run_pacman_before_standard_targets(state: &AppState, plan: PacmanUpgradePlan) -> bool {
-    run_pacman_at_position(state, plan, true).await
+async fn run_pacman_before_standard_targets(plan: PacmanUpgradePlan) -> bool {
+    run_pacman_at_position(plan, true).await
 }
 
-async fn run_pacman_after_standard_targets(state: &AppState, plan: PacmanUpgradePlan) -> bool {
-    run_pacman_at_position(state, plan, false).await
+async fn run_pacman_after_standard_targets(plan: PacmanUpgradePlan) -> bool {
+    run_pacman_at_position(plan, false).await
 }
 
-async fn run_pacman_at_position(
-    state: &AppState,
-    plan: PacmanUpgradePlan,
-    before_standard_targets: bool,
-) -> bool {
+async fn run_pacman_at_position(plan: PacmanUpgradePlan, before_standard_targets: bool) -> bool {
     if plan.should_run(before_standard_targets) {
         crate::terminal::business::report("pacman", crate::terminal::business::Status::Updating);
-        let success = run_pacman_upgrade(state).await;
+        let success = run_pacman_upgrade().await;
         crate::terminal::business::report(
             "pacman",
             if success {
@@ -288,8 +284,8 @@ fn run_flatpak_target<'a>(_state: &'a AppState, _self_pkg: &'a str) -> StandardU
     Box::pin(async { StandardUpgradeOutcome::from_success(upgrade_flatpak().await) })
 }
 
-fn run_dnf_target<'a>(state: &'a AppState, _self_pkg: &'a str) -> StandardUpgradeFuture<'a> {
-    Box::pin(async move { StandardUpgradeOutcome::from_success(upgrade_dnf(state).await) })
+fn run_dnf_target<'a>(_state: &'a AppState, _self_pkg: &'a str) -> StandardUpgradeFuture<'a> {
+    Box::pin(async { StandardUpgradeOutcome::from_success(upgrade_dnf().await) })
 }
 
 fn run_pkg_target<'a>(_state: &'a AppState, _self_pkg: &'a str) -> StandardUpgradeFuture<'a> {
@@ -506,20 +502,9 @@ async fn upgrade_flatpak() -> bool {
     .await
 }
 
-async fn upgrade_dnf(state: &AppState) -> bool {
-    let (privilege_command, reason) = dnf_privilege_command(state).await;
-
-    if privilege_command == "pkexec" && !command_exists(privilege_command).await {
-        println!("[dnf] 未安装 pkexec, 无法使用 GUI 提权.");
-        println!("[dnf] 包升级失败.");
-        return false;
-    }
-    if let Some(reason) = reason {
-        println!("[dnf] {reason}");
-    }
-
-    print_command(&format!("{privilege_command} dnf upgrade --refresh"));
-    match run_inherit(privilege_command, &["dnf", "upgrade", "--refresh"]).await {
+async fn upgrade_dnf() -> bool {
+    print_command("sudo dnf upgrade --refresh");
+    match run_inherit("sudo", &["dnf", "upgrade", "--refresh"]).await {
         Ok(true) => {
             println!("[dnf] 包升级完成.");
             true
@@ -1249,27 +1234,9 @@ async fn spawn_windows_message_box(title: &str, body: &str) -> io::Result<()> {
     })
 }
 
-async fn run_pacman_upgrade(state: &AppState) -> bool {
-    let (privilege_command, reason) = pacman_privilege_command(state).await;
-
-    if !pacman_privilege_command_available(privilege_command).await {
-        return false;
-    }
-
-    if let Some(reason) = reason {
-        println!("[pacman] {reason}");
-    }
-    print_command(&format!("{privilege_command} pacman -Syu"));
-    print_pacman_upgrade_result(run_inherit(privilege_command, &["pacman", "-Syu"]).await)
-}
-
-async fn pacman_privilege_command_available(privilege_command: &str) -> bool {
-    if privilege_command != "pkexec" || command_exists(privilege_command).await {
-        return true;
-    }
-    println!("[pacman] 未安装 pkexec, 无法使用 GUI 提权.");
-    println!("[pacman] 包升级失败.");
-    false
+async fn run_pacman_upgrade() -> bool {
+    print_command("sudo pacman -Syu");
+    print_pacman_upgrade_result(run_inherit("sudo", &["pacman", "-Syu"]).await)
 }
 
 fn print_pacman_upgrade_result(result: io::Result<bool>) -> bool {
@@ -1279,53 +1246,6 @@ fn print_pacman_upgrade_result(result: io::Result<bool>) -> bool {
     } else {
         println!("[pacman] 包升级失败.");
         false
-    }
-}
-
-async fn pacman_privilege_command(state: &AppState) -> (&'static str, Option<&'static str>) {
-    linux_package_privilege_command(state.is_arch_linux).await
-}
-
-async fn dnf_privilege_command(state: &AppState) -> (&'static str, Option<&'static str>) {
-    linux_package_privilege_command(state.is_asahi_linux).await
-}
-
-async fn linux_package_privilege_command(
-    profile_supports_desktop_auth: bool,
-) -> (&'static str, Option<&'static str>) {
-    if !profile_supports_desktop_auth || !desktop_linux_session() {
-        return ("sudo", None);
-    }
-
-    linux_package_privilege_for_context(
-        profile_supports_desktop_auth,
-        true,
-        terminal_focus_state().await,
-    )
-}
-
-fn linux_package_privilege_for_context(
-    profile_supports_desktop_auth: bool,
-    desktop_session: bool,
-    focus: TerminalFocusState,
-) -> (&'static str, Option<&'static str>) {
-    if profile_supports_desktop_auth && desktop_session {
-        pacman_privilege_for_focus(focus)
-    } else {
-        ("sudo", None)
-    }
-}
-
-fn pacman_privilege_for_focus(state: TerminalFocusState) -> (&'static str, Option<&'static str>) {
-    match state {
-        TerminalFocusState::Focused => ("sudo", None),
-        TerminalFocusState::NotFocused => {
-            ("pkexec", Some("terminal 未处于桌面焦点, 使用 GUI 提权."))
-        }
-        TerminalFocusState::Unknown => (
-            "pkexec",
-            Some("无法确认 terminal 处于桌面焦点, 使用 GUI 提权."),
-        ),
     }
 }
 
@@ -1605,8 +1525,7 @@ mod tests {
     use super::{
         RUSTUP_UPDATE_ARGS, ScoopBlockedUpdate, ScoopInstallScope, ScoopTaskOutcome,
         ScoopUpdateTask, TerminalFocusState, UpgradeFailures, build_scoop_update_tasks,
-        linux_package_privilege_for_context, paru_password_attention_reason,
-        scoop_retry_after_kill,
+        paru_password_attention_reason, scoop_retry_after_kill,
     };
     use crate::parse::ScoopExportApp;
 
@@ -2015,26 +1934,6 @@ function Stop-Process {{
         assert!(
             paru_password_attention_reason(TerminalFocusState::Unknown)
                 .is_some_and(|reason| reason.contains("无法确认"))
-        );
-    }
-
-    #[test]
-    fn linux_package_targets_use_sudo_or_pkexec_from_context() {
-        assert_eq!(
-            linux_package_privilege_for_context(true, true, TerminalFocusState::Focused),
-            ("sudo", None)
-        );
-        assert_eq!(
-            linux_package_privilege_for_context(true, true, TerminalFocusState::NotFocused),
-            ("pkexec", Some("terminal 未处于桌面焦点, 使用 GUI 提权."))
-        );
-        assert_eq!(
-            linux_package_privilege_for_context(true, false, TerminalFocusState::Unknown),
-            ("sudo", None)
-        );
-        assert_eq!(
-            linux_package_privilege_for_context(false, true, TerminalFocusState::NotFocused),
-            ("sudo", None)
         );
     }
 

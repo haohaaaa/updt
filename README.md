@@ -116,9 +116,9 @@ Target-specific notes:
 - `cargo-binstall` is recommended for faster binary installation of cargo-managed tools, except on Android (Termux).
 - `dnf` checks require support for `dnf check-update --json` (DNF5).
 - `dnf` upgrades refresh repository metadata with `--refresh` so the elevated command sees current updates.
-- `dnf` upgrades may use `sudo` or `pkexec`, depending on terminal focus and desktop session state.
+- `dnf` upgrades use `sudo`, with authentication handled in the terminal.
 - Termux `pkg` checks refresh repository metadata with `pkg update` and inspect candidates with `apt list --upgradable`.
-- `pacman` upgrades may use `sudo` or `pkexec`, depending on terminal focus and desktop session state.
+- `pacman` upgrades use `sudo`, with authentication handled in the terminal.
 
 ## Interactive Flow
 

@@ -8,4 +8,4 @@ Include enough detail to reproduce the issue, including the operating system, af
 
 ## Scope
 
-Security-sensitive areas include command execution, package manager argument handling, privilege escalation paths such as `sudo` or `pkexec`, and parsing of package manager output.
+Security-sensitive areas include command execution, package manager argument handling, privilege escalation paths such as `sudo`, and parsing of package manager output.
