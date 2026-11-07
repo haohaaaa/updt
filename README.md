@@ -55,7 +55,15 @@ updt update npm cargo
 updt update npm,cargo
 ```
 
-Install fish completions:
+Native Cargo builds on Linux and macOS automatically install fish completions to `$XDG_CONFIG_HOME/fish/completions/updt.fish`, or `~/.config/fish/completions/updt.fish` by default. This includes `cargo install`, `cargo build`, and `cargo test` when the build script runs. Windows and cross-compilation skip automatic installation. A completion write failure produces a warning and does not stop the build.
+
+To disable automatic installation:
+
+```bash
+UPDT_INSTALL_FISH_COMPLETION=0 cargo install updt
+```
+
+Cargo may reuse a cached build script. Install or refresh fish completions manually when needed:
 
 ```bash
 updt fish
@@ -67,7 +75,7 @@ updt fish
 - Inline command-line prompts for selecting which targets to upgrade, with an optional embedded terminal interface.
 - Direct non-interactive updates with explicit target names.
 - OS profile policy that only enables targets that make sense for the current platform.
-- Shell completion generation for Bash, Elvish, fish, PowerShell, and Zsh, plus a fish installer.
+- Shell completion generation for Bash, Elvish, fish, PowerShell, and Zsh, with automatic fish installation during native Linux and macOS builds.
 - Uses existing package manager commands and forwards their output.
 
 ## Supported Update Targets
@@ -207,7 +215,7 @@ updt update npm,cargo
 updt update npm cargo
 ```
 
-Install fish completion to `~/.config/fish/completions/updt.fish`:
+Install or refresh fish completion in `$XDG_CONFIG_HOME/fish/completions` (default: `~/.config/fish/completions`):
 
 ```bash
 updt fish

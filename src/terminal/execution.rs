@@ -297,9 +297,17 @@ impl Sessions {
             while !stopped.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // macOS may inherit the listener's nonblocking mode.
+                        // Frame reads here must wait for a complete request.
+                        if stream.set_nonblocking(false).is_err()
+                            || stream
+                                .set_read_timeout(Some(Duration::from_secs(10)))
+                                .is_err()
+                        {
+                            continue;
+                        }
                         // One local workflow owns the endpoint. Do not let an
                         // unauthenticated peer submit commands to the UI.
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                         if let Ok(request) = read_frame::<Request>(&mut stream, 1024 * 1024)
                             && request.token == secret
                         {
@@ -724,6 +732,47 @@ mod tests {
         assert_eq!(sessions.active, Some(sessions.panes[0].id));
         sessions.cycle(false);
         assert!(sessions.active.is_none());
+    }
+
+    #[test]
+    fn request_can_arrive_in_separate_header_and_payload_chunks() {
+        let mut sessions = Sessions::new().unwrap();
+        let request = request(&sessions, "exit 0", Mode::Capture);
+        let mut stream = TcpStream::connect(sessions.address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let client = std::thread::spawn(move || -> io::Result<Reply> {
+            let payload = serde_json::to_vec(&request).unwrap();
+            let length = (payload.len() as u32).to_be_bytes();
+            // Let the server accept before sending anything, then split both
+            // header and payload to exercise reads that must wait for data.
+            for chunk in [
+                &length[..2],
+                &length[2..],
+                &payload[..payload.len() / 2],
+                &payload[payload.len() / 2..],
+            ] {
+                std::thread::sleep(Duration::from_millis(50));
+                stream.write_all(chunk)?;
+            }
+            read_frame(&mut stream, MAX_FRAME)
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !client.is_finished() {
+            sessions.poll(size(), true).unwrap();
+            assert!(Instant::now() < deadline, "chunked request timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        match client
+            .join()
+            .unwrap()
+            .expect("chunked request was rejected")
+        {
+            Reply::Output(result) => assert_eq!(result.code, 0),
+            Reply::Error(err) => panic!("{err}"),
+        }
+        assert_eq!(sessions.panes.len(), 1);
     }
 
     #[test]

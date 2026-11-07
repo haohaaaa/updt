@@ -1,6 +1,6 @@
 [package]
 name = "updt"
-version = "4.1.0"
+version = "4.2.0"
 edition = "2024"
 description = "Cross-platform update helper for npm, cargo, rustup, scoop, Homebrew, paru, flatpak, pacman, DNF, and pkg."
 license = "MIT"
@@ -27,3 +27,7 @@ tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 assert_cmd = "2.2"
+
+[build-dependencies]
+clap = "4.6"
+clap_complete = "4.6"

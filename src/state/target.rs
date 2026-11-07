@@ -1,8 +1,6 @@
 use super::{AppState, TargetStateFlags};
 
-pub const TARGET_IDS: [&str; 10] = [
-    "brew", "npm", "cargo", "rustup", "scoop", "paru", "flatpak", "pacman", "dnf", "pkg",
-];
+pub use crate::targets::TARGET_IDS;
 
 struct TargetMeta {
     id: &'static str,

@@ -12,6 +12,7 @@ mod parse;
 mod profile;
 mod selection;
 mod state;
+mod targets;
 mod terminal;
 mod upgrade;
 
@@ -40,7 +41,7 @@ struct RunContext {
 
 async fn run_app() -> i32 {
     let cli = parse_cli();
-    if let Some(code) = handle_completion_command(&cli).await {
+    if let Some(code) = handle_completion_command(&cli) {
         return code;
     }
     if matches!(cli, CliCommand::TerminalDemo) {
@@ -99,7 +100,7 @@ impl RunContext {
     }
 }
 
-async fn handle_completion_command(cli: &CliCommand) -> Option<i32> {
+fn handle_completion_command(cli: &CliCommand) -> Option<i32> {
     if let CliCommand::Completions(shell) = cli {
         return Some(match print_completion(*shell) {
             Ok(()) => 0,
@@ -113,7 +114,7 @@ async fn handle_completion_command(cli: &CliCommand) -> Option<i32> {
     if !matches!(cli, CliCommand::Fish) {
         return None;
     }
-    Some(match install_fish_completion().await {
+    Some(match install_fish_completion() {
         Ok(path) => {
             println!("fish completion 已写入: {}", path.display());
             0
