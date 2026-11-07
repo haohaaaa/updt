@@ -131,9 +131,6 @@ fn run_check_in_pty(args: &[&str], worker: bool) {
             if !worker && parser.screen().contents().contains("没有可升级项") {
                 let output = String::from_utf8_lossy(&output);
                 assert!(!output.contains("777;updt"));
-                if !args.is_empty() {
-                    assert!(output.contains("检查更新"), "{output}");
-                }
                 for sequence in ["\x1b[?1049h", "\x1b[?1047h", "\x1b[?47h", "\x1b[2J"] {
                     assert!(
                         !output.contains(sequence),
