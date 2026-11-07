@@ -5,6 +5,26 @@ use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+#[derive(Default)]
+struct TerminalReplies(Vec<u8>);
+
+impl vt100::Callbacks for TerminalReplies {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        _: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        command: char,
+    ) {
+        if command == 'n' && params.first().and_then(|value| value.first()) == Some(&6) {
+            let (row, col) = screen.cursor_position();
+            self.0
+                .extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+        }
+    }
+}
+
 // Only the test executable can enter this fixture. It selects synthetic targets
 // directly, so no package-manager commands or real updates can run.
 #[tokio::test(flavor = "multi_thread")]
@@ -69,7 +89,12 @@ fn run_inline_prompt(keys: &[u8], expected: &str) {
         }
     });
     let mut bytes = Vec::new();
-    let mut parser = vt100::Parser::new(30.try_into().unwrap(), 120.try_into().unwrap(), 100);
+    let mut parser = vt100::Parser::new_with_callbacks(
+        30.try_into().unwrap(),
+        120.try_into().unwrap(),
+        100,
+        TerminalReplies::default(),
+    );
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut selected = false;
     let mut continued = false;
@@ -77,6 +102,11 @@ fn run_inline_prompt(keys: &[u8], expected: &str) {
         if let Ok(chunk) = receiver.recv_timeout(Duration::from_millis(20)) {
             parser.process(&chunk);
             bytes.extend(chunk);
+        }
+        let replies = std::mem::take(&mut parser.callbacks_mut().0);
+        if !replies.is_empty() {
+            writer.write_all(&replies).unwrap();
+            writer.flush().unwrap();
         }
         let output = String::from_utf8_lossy(&bytes);
         if !selected && output.contains("Esc: 退出") {
