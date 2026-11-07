@@ -63,11 +63,11 @@ updt fish
 
 ## Features
 
-- Parallel checks across enabled targets for faster detection.
+- Parallel checks across enabled targets with an inline spinner and completed-target count.
 - Inline command-line prompts for selecting which targets to upgrade, with an optional embedded terminal interface.
 - Direct non-interactive updates with explicit target names.
 - OS profile policy that only enables targets that make sense for the current platform.
-- Fish shell completion installer.
+- Shell completion generation for Bash, Elvish, fish, PowerShell, and Zsh, plus a fish installer.
 - Uses existing package manager commands and forwards their output.
 
 ## Supported Update Targets
@@ -128,7 +128,7 @@ Running `updt` starts a three-stage workflow:
 2. Select targets to upgrade.
 3. Run upgrades for selected targets.
 
-The check stage runs in parallel across enabled targets and prints progress and results in the current terminal. Selection uses an inline checkbox prompt, like a typical `npx` setup script. It does not open a full-screen TUI or switch to an alternate screen, so previous output stays in your terminal history. Available targets are checked by default; press Enter to confirm and start upgrading. The upgrade stage runs the underlying package manager commands and forwards their output. With redirected input or output, selection uses sequential `[Y/n]` prompts instead.
+The check stage runs in parallel across enabled targets and prints results above an inline spinner with a completed-target count. Redirected output uses plain log lines. Selection uses an inline checkbox prompt, like a typical `npx` setup script. It does not open a full-screen TUI or switch to an alternate screen, so previous output stays in your terminal history. Available targets are checked by default; press Enter to confirm and start upgrading. The upgrade stage runs the underlying package manager commands and forwards their output. With redirected input or output, selection uses sequential `[Y/n]` prompts instead.
 
 On Windows, Scoop's `rustup` package update and cargo's `updt` self-update are deferred until all other updates finish. A single foreground window waits for the current `updt` process to exit, then updates Scoop's `rustup` package (preserving local/global scope), followed by `updt` itself. The main summary lists these as pending; their final results appear in the separate window. Rust toolchain updates (`rustup update --no-self-update`) still run during the normal upgrade stage.
 
@@ -212,6 +212,18 @@ Install fish completion to `~/.config/fish/completions/updt.fish`:
 ```bash
 updt fish
 ```
+
+Generate a shell completion script to stdout:
+
+```bash
+updt completions bash
+updt completions elvish
+updt completions fish
+updt completions powershell
+updt completions zsh
+```
+
+Save or source the generated script according to your shell's completion setup. `updt fish` installs the same generated fish script automatically. Completion scripts are generated from the public CLI definition. Bash, fish, and Zsh suggest target names and shell values as well as commands and options. The static Elvish and PowerShell generators currently suggest command and option names only.
 
 ## Development
 

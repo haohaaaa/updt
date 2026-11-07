@@ -1,3 +1,4 @@
+use assert_cmd::cargo::cargo_bin_cmd;
 use portable_pty::{CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::sync::mpsc;
@@ -130,6 +131,9 @@ fn run_check_in_pty(args: &[&str], worker: bool) {
             if !worker && parser.screen().contents().contains("没有可升级项") {
                 let output = String::from_utf8_lossy(&output);
                 assert!(!output.contains("777;updt"));
+                if !args.is_empty() {
+                    assert!(output.contains("检查更新"), "{output}");
+                }
                 for sequence in ["\x1b[?1049h", "\x1b[?1047h", "\x1b[?47h", "\x1b[2J"] {
                     assert!(
                         !output.contains(sequence),
@@ -163,13 +167,15 @@ fn run_check_in_pty(args: &[&str], worker: bool) {
 
 #[test]
 fn legacy_text_entry_does_not_emit_embedded_terminal_protocol() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_updt"))
+    let result = cargo_bin_cmd!("updt")
         .args(["update", disabled_target()])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        .timeout(Duration::from_secs(10))
+        .assert()
+        .success()
+        .stderr("");
+    let stdout = String::from_utf8_lossy(&result.get_output().stdout);
     assert!(!stdout.contains("777;updt"));
+    assert!(!stdout.contains('\x1b'), "{stdout}");
     assert!(stdout.contains("没有可升级项"));
 }
 
@@ -180,11 +186,12 @@ fn validation_modes_cannot_be_combined_with_update_targets() {
         vec!["terminal", "--shell", "npm"],
         vec!["terminal", "--demo", "--shell"],
     ] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_updt"))
+        cargo_bin_cmd!("updt")
             .args(args)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(2), "{output:?}");
+            .timeout(Duration::from_secs(10))
+            .assert()
+            .code(2)
+            .stdout("");
     }
 }
 

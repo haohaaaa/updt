@@ -1,11 +1,14 @@
 use crossterm::style::Color as TermColor;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressFinish, ProgressStyle};
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::checks::{CheckResult, merge_check_result, run_single_check};
 use crate::command::command_exists;
 use crate::output::{MsgKind, color_bold, log_pkg_line, print_section};
+use crate::profile::interactive_terminal;
 use crate::state::{
     AppState, TARGET_IDS, TargetStateFlags, section_title, target_enabled, target_label,
     target_state_flags, target_update_summary,
@@ -81,7 +84,7 @@ async fn finish_check_workers(
 pub async fn run_checks_plain(state: &mut AppState, targets: &[String]) {
     let (handles, mut rx) = spawn_check_workers(targets);
     print_check_header(targets);
-    print_check_events(&mut rx).await;
+    print_check_events(&mut rx, targets.len()).await;
 
     let logs_map = finish_check_workers(state, handles).await;
     print_check_logs(targets, &logs_map);
@@ -102,30 +105,56 @@ fn print_check_header(targets: &[String]) {
     );
 }
 
-async fn print_check_events(rx: &mut mpsc::UnboundedReceiver<CheckEvent>) {
-    while let Some(line) = rx.recv().await {
-        print_check_event(line);
+async fn print_check_events(rx: &mut mpsc::UnboundedReceiver<CheckEvent>, target_count: usize) {
+    let progress = check_progress(target_count);
+    while let Some(event) = rx.recv().await {
+        if crate::terminal::business::is_worker() {
+            continue;
+        }
+        let line = check_event_line(&event);
+        if let Some(progress) = &progress {
+            if matches!(event, CheckEvent::Finished { .. }) {
+                progress.inc(1);
+            }
+            progress.println(line);
+        } else {
+            println!("{line}");
+        }
+    }
+    if let Some(progress) = progress {
+        progress.finish_and_clear();
     }
 }
 
-fn print_check_event(line: CheckEvent) {
-    if crate::terminal::business::is_worker() {
-        return;
+fn check_progress(target_count: usize) -> Option<ProgressBar> {
+    if target_count == 0 || crate::terminal::business::is_worker() || !interactive_terminal() {
+        return None;
     }
-    match line {
-        CheckEvent::Started(target) => {
-            println!("{}", log_pkg_line(&target, "开始检查...", MsgKind::Info));
-        }
+    let draw_target = ProgressDrawTarget::stdout_with_hz(10);
+    if draw_target.is_hidden() {
+        return None;
+    }
+    let progress = ProgressBar::with_draw_target(Some(target_count as u64), draw_target)
+        .with_style(
+            ProgressStyle::with_template(
+                "{spinner:.cyan} 检查更新 {pos}/{len} [{elapsed_precise}]",
+            )
+            .expect("valid check progress template"),
+        )
+        .with_finish(ProgressFinish::AndClear);
+    progress.enable_steady_tick(Duration::from_millis(100));
+    progress.tick();
+    Some(progress)
+}
+
+fn check_event_line(event: &CheckEvent) -> String {
+    match event {
+        CheckEvent::Started(target) => log_pkg_line(target, "开始检查...", MsgKind::Info),
         CheckEvent::Finished {
             target,
             kind,
             summary,
-        } => {
-            println!(
-                "{}",
-                log_pkg_line(&target, &format!("检查完成: {summary}"), kind)
-            );
-        }
+        } => log_pkg_line(target, &format!("检查完成: {summary}"), *kind),
     }
 }
 

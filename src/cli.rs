@@ -1,4 +1,5 @@
 use clap::{Arg, Command as ClapCommand, builder::PossibleValuesParser};
+use clap_complete::Shell;
 
 use crate::state::TARGET_IDS;
 
@@ -6,6 +7,7 @@ pub enum CliCommand {
     Default,
     Update(Vec<String>),
     Fish,
+    Completions(Shell),
     Terminal {
         targets: Vec<String>,
         demo: bool,
@@ -18,8 +20,9 @@ pub enum CliCommand {
     },
 }
 
-pub fn parse_cli() -> CliCommand {
-    let matches = ClapCommand::new("updt")
+/// Public commands shared by argument parsing and shell completion generation.
+pub fn build_cli() -> ClapCommand {
+    ClapCommand::new("updt")
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand(
             ClapCommand::new("update")
@@ -57,6 +60,24 @@ pub fn parse_cli() -> CliCommand {
                         .value_parser(PossibleValuesParser::new(TARGET_IDS)),
                 ),
         )
+        .subcommand(
+            ClapCommand::new("fish")
+                .about("Install fish completion to ~/.config/fish/completions/updt.fish"),
+        )
+        .subcommand(
+            ClapCommand::new("completions")
+                .about("Generate shell completions to stdout")
+                .arg(
+                    Arg::new("shell")
+                        .required(true)
+                        .value_parser(clap::value_parser!(Shell)),
+                ),
+        )
+}
+
+pub fn parse_cli() -> CliCommand {
+    // Internal execution entry points are deliberately absent from completions.
+    let matches = build_cli()
         .subcommand(ClapCommand::new("__terminal-demo").hide(true))
         .subcommand(
             ClapCommand::new("__terminal-worker")
@@ -74,10 +95,6 @@ pub fn parse_cli() -> CliCommand {
                         .value_parser(PossibleValuesParser::new(TARGET_IDS)),
                 ),
         )
-        .subcommand(
-            ClapCommand::new("fish")
-                .about("Install fish completion to ~/.config/fish/completions/updt.fish"),
-        )
         .get_matches();
 
     match matches.subcommand() {
@@ -87,6 +104,9 @@ pub fn parse_cli() -> CliCommand {
                 .unwrap_or_default(),
         ),
         Some(("fish", _)) => CliCommand::Fish,
+        Some(("completions", sub)) => {
+            CliCommand::Completions(*sub.get_one::<Shell>("shell").expect("required shell"))
+        }
         Some(("terminal", sub)) => CliCommand::Terminal {
             targets: sub
                 .get_many::<String>("targets")

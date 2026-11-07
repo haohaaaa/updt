@@ -16,7 +16,7 @@ mod terminal;
 mod upgrade;
 
 use crate::cli::{CliCommand, parse_cli};
-use crate::completion::install_fish_completion;
+use crate::completion::{install_fish_completion, print_completion};
 use crate::flow::check::{
     any_check_failed, build_upgradable_targets, resolve_check_targets, run_checks_plain,
 };
@@ -40,7 +40,7 @@ struct RunContext {
 
 async fn run_app() -> i32 {
     let cli = parse_cli();
-    if let Some(code) = handle_fish_command(&cli).await {
+    if let Some(code) = handle_completion_command(&cli).await {
         return code;
     }
     if matches!(cli, CliCommand::TerminalDemo) {
@@ -99,7 +99,17 @@ impl RunContext {
     }
 }
 
-async fn handle_fish_command(cli: &CliCommand) -> Option<i32> {
+async fn handle_completion_command(cli: &CliCommand) -> Option<i32> {
+    if let CliCommand::Completions(shell) = cli {
+        return Some(match print_completion(*shell) {
+            Ok(()) => 0,
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => 0,
+            Err(err) => {
+                eprintln!("[completions] 输出失败: {err}");
+                1
+            }
+        });
+    }
     if !matches!(cli, CliCommand::Fish) {
         return None;
     }
