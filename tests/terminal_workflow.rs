@@ -55,6 +55,28 @@ impl Drop for ChildGuard {
 
 #[test]
 fn business_worker_runs_inside_native_pty_and_reports_real_check_results() {
+    run_check_in_pty(
+        &[
+            "__terminal-worker",
+            "--owner-pid",
+            &std::process::id().to_string(),
+            disabled_target(),
+        ],
+        true,
+    );
+}
+
+#[test]
+fn default_cli_in_a_tty_does_not_enter_a_full_screen_ui() {
+    run_check_in_pty(&[], false);
+}
+
+#[test]
+fn explicit_update_in_a_tty_does_not_enter_a_full_screen_ui() {
+    run_check_in_pty(&["update", disabled_target()], false);
+}
+
+fn run_check_in_pty(args: &[&str], worker: bool) {
     let pair = portable_pty::native_pty_system()
         .openpty(PtySize {
             rows: 30,
@@ -66,12 +88,11 @@ fn business_worker_runs_inside_native_pty_and_reports_real_check_results() {
     let mut reader = pair.master.try_clone_reader().unwrap();
     let mut writer = pair.master.take_writer().unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_updt"));
-    command.args([
-        "__terminal-worker",
-        "--owner-pid",
-        &std::process::id().to_string(),
-        disabled_target(),
-    ]);
+    command.args(args);
+    // Keep the default entry point deterministic and prevent real checks.
+    if args.is_empty() {
+        command.env("PATH", "");
+    }
     command.env("TERM", "xterm-256color");
     let mut child = ChildGuard(pair.slave.spawn_command(command).unwrap());
     drop(pair.slave);
@@ -93,9 +114,11 @@ fn business_worker_runs_inside_native_pty_and_reports_real_check_results() {
         Events::default(),
     );
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut output = Vec::new();
     loop {
         if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(50)) {
             parser.process(&bytes);
+            output.extend(bytes);
         }
         let replies = std::mem::take(&mut parser.callbacks_mut().1);
         if !replies.is_empty() {
@@ -104,6 +127,17 @@ fn business_worker_runs_inside_native_pty_and_reports_real_check_results() {
         }
         if let Some(status) = child.0.try_wait().unwrap() {
             assert_eq!(status.exit_code(), 0, "{}", parser.screen().contents());
+            if !worker && parser.screen().contents().contains("没有可升级项") {
+                let output = String::from_utf8_lossy(&output);
+                assert!(!output.contains("777;updt"));
+                for sequence in ["\x1b[?1049h", "\x1b[?1047h", "\x1b[?47h", "\x1b[2J"] {
+                    assert!(
+                        !output.contains(sequence),
+                        "unexpected full-screen operation: {output}"
+                    );
+                }
+                break;
+            }
             if parser
                 .callbacks()
                 .0
@@ -119,10 +153,12 @@ fn business_worker_runs_inside_native_pty_and_reports_real_check_results() {
             parser.screen().contents()
         );
     }
-    let events = &parser.callbacks().0;
-    assert!(events.contains(&(disabled_target().into(), "checking".into())));
-    assert!(events.contains(&(disabled_target().into(), "skipped".into())));
-    assert!(!events.iter().any(|(_, status)| status == "updating"));
+    if worker {
+        let events = &parser.callbacks().0;
+        assert!(events.contains(&(disabled_target().into(), "checking".into())));
+        assert!(events.contains(&(disabled_target().into(), "skipped".into())));
+        assert!(!events.iter().any(|(_, status)| status == "updating"));
+    }
 }
 
 #[test]

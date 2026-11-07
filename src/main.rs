@@ -1,6 +1,5 @@
 use chrono::Local;
 use crossterm::style::Color as TermColor;
-use std::io;
 use std::process;
 
 mod checks;
@@ -14,20 +13,16 @@ mod profile;
 mod selection;
 mod state;
 mod terminal;
-mod ui;
 mod upgrade;
 
 use crate::cli::{CliCommand, parse_cli};
 use crate::completion::install_fish_completion;
 use crate::flow::check::{
-    any_check_failed, build_upgradable_targets, resolve_check_targets, run_checks, run_checks_plain,
+    any_check_failed, build_upgradable_targets, resolve_check_targets, run_checks_plain,
 };
-use crate::flow::interactive::{
-    InteractiveResult, offer_install_cargo_binstall, offer_install_cargo_update,
-    run_interactive_flow,
-};
-use crate::output::{color_bold, ok_text, print_exit_signal_message, print_section, warn_text};
-use crate::profile::{interactive_terminal, parse_profile};
+use crate::flow::interactive::{offer_install_cargo_binstall, offer_install_cargo_update};
+use crate::output::{color_bold, ok_text, print_section, warn_text};
+use crate::profile::parse_profile;
 use crate::selection::{resolve_cli_selection, select_targets, select_targets_prompt};
 use crate::state::{AppState, profile_name};
 use crate::upgrade::upgrade_selected;
@@ -41,7 +36,6 @@ struct RunContext {
     state: AppState,
     requested_updates: Vec<String>,
     start_time: String,
-    force_text_flow: bool,
 }
 
 async fn run_app() -> i32 {
@@ -84,10 +78,6 @@ async fn run_app() -> i32 {
     }
 
     let mut ctx = RunContext::new(requested_updates(&cli)).await;
-    if let Some(code) = try_interactive_start(&mut ctx).await {
-        return code;
-    }
-
     print_text_header_if_needed(&ctx);
     run_checks_for_context(&mut ctx).await;
     terminal::business::phase("preparing");
@@ -105,7 +95,6 @@ impl RunContext {
             state,
             requested_updates,
             start_time,
-            force_text_flow: terminal::business::is_worker(),
         }
     }
 }
@@ -133,38 +122,6 @@ fn requested_updates(cli: &CliCommand) -> Vec<String> {
     }
 }
 
-async fn try_interactive_start(ctx: &mut RunContext) -> Option<i32> {
-    if interactive_terminal() && !terminal::business::is_worker() {
-        return handle_interactive_result(
-            run_interactive_flow(&mut ctx.state, &ctx.requested_updates, &ctx.start_time).await,
-            ctx,
-        )
-        .await;
-    }
-    None
-}
-
-async fn handle_interactive_result(
-    result: io::Result<InteractiveResult>,
-    ctx: &mut RunContext,
-) -> Option<i32> {
-    match result {
-        Ok(InteractiveResult::Exit(code)) => Some(code),
-        Ok(InteractiveResult::RunUpgrade(selected_targets)) => {
-            Some(upgrade_exit_code(&ctx.state, &selected_targets).await)
-        }
-        Err(err) => {
-            if err.kind() == io::ErrorKind::Interrupted {
-                print_exit_signal_message();
-                return Some(0);
-            }
-            eprintln!("[ui] TUI 运行失败, 自动回退文本流程: {err}");
-            ctx.force_text_flow = true;
-            None
-        }
-    }
-}
-
 async fn upgrade_exit_code(state: &AppState, selected_targets: &[String]) -> i32 {
     terminal::business::phase("upgrading");
     if upgrade_selected(state, selected_targets).await {
@@ -178,29 +135,23 @@ fn print_text_header_if_needed(ctx: &RunContext) {
     if terminal::business::is_worker() {
         return;
     }
-    if !interactive_terminal() || ctx.force_text_flow {
-        print_section("检查可升级项");
-        println!(
-            "{}: {}",
-            color_bold("开始时间", TermColor::Blue),
-            ctx.start_time
-        );
-        println!(
-            "{}: {}",
-            color_bold("系统策略", TermColor::Blue),
-            profile_name(ctx.state.system_profile)
-        );
-    }
+    print_section("检查可升级项");
+    println!(
+        "{}: {}",
+        color_bold("开始时间", TermColor::Blue),
+        ctx.start_time
+    );
+    println!(
+        "{}: {}",
+        color_bold("系统策略", TermColor::Blue),
+        profile_name(ctx.state.system_profile)
+    );
 }
 
 async fn run_checks_for_context(ctx: &mut RunContext) {
     terminal::business::phase("checking");
-    if ctx.force_text_flow {
-        let targets = resolve_check_targets(&ctx.state, &ctx.requested_updates);
-        run_checks_plain(&mut ctx.state, &targets).await;
-    } else {
-        run_checks(&mut ctx.state, &ctx.requested_updates, &ctx.start_time).await;
-    }
+    let targets = resolve_check_targets(&ctx.state, &ctx.requested_updates);
+    run_checks_plain(&mut ctx.state, &targets).await;
 }
 
 async fn finish_after_checks(ctx: &mut RunContext) -> i32 {
@@ -210,9 +161,7 @@ async fn finish_after_checks(ctx: &mut RunContext) -> i32 {
         return no_upgrades_exit_code(&ctx.state);
     }
 
-    if !interactive_terminal() {
-        print_section("选择要升级的项目");
-    }
+    print_section("选择要升级的项目");
     let selected_targets = select_after_checks(ctx, &upgradable_targets).await;
     selected_upgrade_exit_code(&ctx.state, &selected_targets).await
 }
@@ -234,7 +183,7 @@ async fn select_after_checks(ctx: &RunContext, upgradable_targets: &[String]) ->
     if !ctx.requested_updates.is_empty() {
         return resolve_cli_selection(&ctx.requested_updates, upgradable_targets);
     }
-    if ctx.force_text_flow {
+    if terminal::business::is_worker() {
         select_targets_prompt(&ctx.state, upgradable_targets).await
     } else {
         select_targets(&ctx.state, upgradable_targets).await

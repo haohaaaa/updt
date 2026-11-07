@@ -1,10 +1,14 @@
-use ratatui::{Terminal, backend::CrosstermBackend};
+use inquire::{MultiSelect, error::InquireError};
 use std::io::{self, IsTerminal};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::output::print_exit_signal_message;
+use crate::profile::interactive_terminal;
 use crate::state::{AppState, target_label, updatable_items_for_target};
-use crate::ui::{TerminalGuard, select_targets_tui};
+
+#[cfg(test)]
+#[path = "selection_tests.rs"]
+mod prompt_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScoopBlockedAction {
@@ -102,55 +106,51 @@ fn prompt_answer_from_error(err: io::Error) -> PromptAnswer {
 }
 
 pub async fn select_targets(state: &AppState, upgradable_targets: &[String]) -> Vec<String> {
-    if terminal_selection_available() {
-        let result = select_targets_with_tui(state, upgradable_targets).await;
-        if let Some(chosen) = handle_tui_selection_result(result) {
-            return chosen;
-        }
+    if upgradable_targets.is_empty() {
+        return Vec::new();
     }
-    select_targets_prompt(state, upgradable_targets).await
-}
+    if !interactive_terminal() || !io::stderr().is_terminal() {
+        return select_targets_prompt(state, upgradable_targets).await;
+    }
 
-fn terminal_selection_available() -> bool {
-    io::stdout().is_terminal() && io::stdin().is_terminal()
-}
-
-async fn select_targets_with_tui(
-    state: &AppState,
-    upgradable_targets: &[String],
-) -> io::Result<Vec<String>> {
-    let _guard = TerminalGuard::enter().await?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
-    select_targets_tui(&mut terminal, state, upgradable_targets).await
-}
-
-fn handle_tui_selection_result(result: io::Result<Vec<String>>) -> Option<Vec<String>> {
+    let items: Vec<_> = upgradable_targets
+        .iter()
+        .map(|target| {
+            let count = updatable_items_for_target(state, target).len();
+            format!("{} ({count} 项更新)", target_label(target))
+        })
+        .collect();
+    let result = tokio::task::block_in_place(|| {
+        MultiSelect::new("选择要升级的项目", items)
+            .with_all_selected_by_default()
+            .without_filtering()
+            .with_help_message("↑/↓: 移动  Space: 勾选  ←: 全不选  →: 全选  Enter: 确认  Esc: 退出")
+            .raw_prompt_skippable()
+    });
     match result {
-        Ok(chosen) => Some(chosen),
-        Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+        Ok(Some(options)) => options
+            .into_iter()
+            .map(|option| upgradable_targets[option.index].clone())
+            .collect(),
+        Ok(None) => Vec::new(),
+        Err(InquireError::OperationInterrupted) => {
             print_exit_signal_message();
-            Some(Vec::new())
+            Vec::new()
         }
         Err(err) => {
-            eprintln!("[ui] TUI 初始化失败, 自动回退文本交互: {err}");
-            None
+            eprintln!("[prompt] 无法读取选择: {err}");
+            Vec::new()
         }
     }
 }
 
 pub fn resolve_cli_selection(requested: &[String], upgradable_targets: &[String]) -> Vec<String> {
-    let mut selected = Vec::<String>::new();
-    for req in requested {
-        if selected.iter().any(|x| x == req) {
-            continue;
-        }
-        if upgradable_targets.iter().any(|x| x == req) {
-            selected.push(req.clone());
-            crate::terminal::business::report(req, crate::terminal::business::Status::Queued);
-        } else {
-            println!("[cli] {} 当前没有可升级项, 跳过.", target_label(req));
-        }
+    let (selected, skipped) = resolve_cli_selection_quiet(requested, upgradable_targets);
+    for target in &selected {
+        crate::terminal::business::report(target, crate::terminal::business::Status::Queued);
+    }
+    for target in &skipped {
+        println!("[cli] {} 当前没有可升级项, 跳过.", target_label(target));
     }
     selected
 }

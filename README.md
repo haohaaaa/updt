@@ -24,7 +24,7 @@ updt
 
 `updt` answers one question quickly: which of my system and developer tools can be upgraded right now?
 
-It checks supported targets in parallel, shows the results in a terminal selector, and upgrades only the targets you confirm. It does not replace any package manager or maintain its own package database; it orchestrates the tools already installed on your machine.
+It checks supported targets in parallel, shows the results with an inline command-line selector, and upgrades only the targets you confirm. It does not replace any package manager or maintain its own package database; it orchestrates the tools already installed on your machine.
 
 ## Why Use It
 
@@ -64,7 +64,7 @@ updt fish
 ## Features
 
 - Parallel checks across enabled targets for faster detection.
-- Interactive terminal UI for selecting which targets to upgrade.
+- Inline command-line prompts for selecting which targets to upgrade, with an optional embedded terminal interface.
 - Direct non-interactive updates with explicit target names.
 - OS profile policy that only enables targets that make sense for the current platform.
 - Fish shell completion installer.
@@ -128,7 +128,7 @@ Running `updt` starts a three-stage workflow:
 2. Select targets to upgrade.
 3. Run upgrades for selected targets.
 
-The check stage runs in parallel across enabled targets. The upgrade stage runs the underlying package manager commands and forwards their output.
+The check stage runs in parallel across enabled targets and prints progress and results in the current terminal. Selection uses an inline checkbox prompt, like a typical `npx` setup script. It does not open a full-screen TUI or switch to an alternate screen, so previous output stays in your terminal history. Available targets are checked by default; press Enter to confirm and start upgrading. The upgrade stage runs the underlying package manager commands and forwards their output. With redirected input or output, selection uses sequential `[Y/n]` prompts instead.
 
 On Windows, Scoop's `rustup` package update and cargo's `updt` self-update are deferred until all other updates finish. A single foreground window waits for the current `updt` process to exit, then updates Scoop's `rustup` package (preserving local/global scope), followed by `updt` itself. The main summary lists these as pending; their final results appear in the separate window. Rust toolchain updates (`rustup update --no-self-update`) still run during the normal upgrade stage.
 
@@ -140,23 +140,24 @@ Selector controls:
 | --- | --- |
 | `Up` / `Down` | Move cursor |
 | `Space` | Toggle selected target |
+| `Left` / `Right` | Deselect or select all targets |
 | `Enter` | Confirm selection |
-| `q` / `Esc` | Quit selection |
+| `Esc` / `Ctrl+C` | Quit selection |
 
 ## CLI Reference
 
 ### Two interactive interfaces
 
-The original interface and the embedded terminal interface have separate entry points:
+The inline command-line interface and the embedded terminal interface have separate entry points:
 
 | Command | Interface |
 | --- | --- |
-| `updt` | Original TUI: checks, target selection and confirmation, then command output |
-| `updt update npm cargo` | Original interface for the requested targets |
+| `updt` | Inline CLI: printed check results, checkbox selection, then command output; no full-screen TUI |
+| `updt update npm cargo` | Inline CLI for the requested targets, without the selector |
 | `updt terminal` | New interface: real target status on the left, checks, confirmation and updates inside the terminal on the right |
 | `updt terminal npm cargo` | New interface for the requested targets; updates the selected targets that have updates |
 
-Without explicit targets, the new interface asks which targets to update in the right-hand terminal. Answer package-manager prompts in their command session. Each command has its own output view, so parallel checks never interleave output from different commands. The workflow view shows parsed check results, confirmation, and the final summary. Update order and deferred Windows updates use the same business logic as the original interface.
+Without explicit targets, the embedded terminal interface asks which targets to update in the right-hand terminal. Answer package-manager prompts in their command session. Each command has its own output view, so parallel checks never interleave output from different commands. The workflow view shows parsed check results, confirmation, and the final summary. Update order and deferred Windows updates use the same business logic as the inline CLI.
 
 The workflow submits commands through an internal Rust execution API. The UI opens a command session, displays the command, and renders its live output while the caller awaits the result. Capture commands return separate, unchanged stdout/stderr for JSON parsing. Interactive commands run in a native PTY and return the merged terminal output and exit code. Display and API results come from the same execution.
 
