@@ -1,4 +1,4 @@
-use super::{confirm_default_yes, select_targets};
+use super::{confirm_default_yes, print_pending_updates, select_targets};
 use crate::state::AppState;
 use portable_pty::{CommandBuilder, PtySize};
 use std::io::{Read, Write};
@@ -34,8 +34,10 @@ async fn inline_prompt_fixture() {
     };
     let mut state = AppState::default();
     state.npm.updatable_items = vec!["example".into()];
+    state.cargo.updatable_packages = vec!["updt".into()];
     let targets = vec!["npm".into(), "cargo".into(), "rustup".into()];
     println!("fixture-history-before-prompt");
+    print_pending_updates(&state, &targets);
     let selected = select_targets(&state, &targets).await;
     println!("fixture-selected:{}", selected.join(","));
     if mode == "pipe" {
@@ -110,6 +112,13 @@ fn run_inline_prompt(keys: &[u8], expected: &str) {
         }
         let output = String::from_utf8_lossy(&bytes);
         if !selected && output.contains("Esc: 退出") {
+            let screen = parser.screen().contents();
+            assert!(screen.contains("待升级清单"), "{screen}");
+            assert!(screen.contains("npm (1 项更新)"), "{screen}");
+            assert!(screen.contains("cargo (1 项更新)"), "{screen}");
+            assert!(screen.contains("rustup (有可升级项)"), "{screen}");
+            assert!(screen.contains("- example"), "{screen}");
+            assert!(screen.contains("- updt"), "{screen}");
             writer.write_all(keys).unwrap();
             writer.flush().unwrap();
             selected = true;
@@ -197,6 +206,11 @@ fn run_piped_prompt(input: &[u8], expected: &str) {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("[Y/n]:"), "{stdout}");
+    assert!(stdout.contains("待升级清单"), "{stdout}");
+    assert!(stdout.contains("npm (1 项更新)\n  - example"), "{stdout}");
+    assert!(stdout.contains("cargo (1 项更新)\n  - updt"), "{stdout}");
+    assert!(stdout.contains("rustup (有可升级项)"), "{stdout}");
+    assert!(!stdout.contains("0 项更新"), "{stdout}");
     assert!(
         stdout.contains(&format!("fixture-selected:{expected}\n")),
         "{stdout}"

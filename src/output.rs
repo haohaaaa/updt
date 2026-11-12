@@ -30,6 +30,15 @@ pub fn color_bold(text: &str, c: TermColor) -> String {
     }
 }
 
+pub fn package_text(item: &str) -> String {
+    let name_end = item.find(char::is_whitespace).unwrap_or(item.len());
+    format!(
+        "{}{}",
+        color_bold(&item[..name_end], TermColor::Cyan),
+        &item[name_end..]
+    )
+}
+
 pub fn ok_text(text: &str) -> String {
     color(text, TermColor::Green)
 }

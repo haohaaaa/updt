@@ -6,7 +6,7 @@ use std::pin::Pin;
 use tokio::fs;
 
 use crate::command::{command_exists, run_capture, run_cargo_install_update_capture, run_output};
-use crate::output::{MsgKind, log_pkg_line};
+use crate::output::{MsgKind, log_pkg_line, package_text};
 use crate::parse::{
     ScoopExportApp, first_json_payload, first_token, parse_cargo_list, parse_scoop_export_output,
 };
@@ -59,7 +59,7 @@ fn mark_check_failed(check_failed: &mut bool, target: &str, message: &str, logs:
 fn log_item_list(logs: &mut Vec<String>, target: &str, header: &str, items: &[String]) {
     logs.push(log_pkg_line(target, header, MsgKind::Info));
     for item in items {
-        logs.push(format!("  - {item}"));
+        logs.push(format!("  - {}", package_text(item)));
     }
 }
 
@@ -495,7 +495,7 @@ fn record_rustup_status(state: &mut AppState, logs: &mut Vec<String>, status: i3
                 ));
                 for line in updatable {
                     state.rustup.updatable_items.push(line.clone());
-                    logs.push(format!("  - {line}"));
+                    logs.push(format!("  - {}", package_text(&line)));
                 }
             }
         }

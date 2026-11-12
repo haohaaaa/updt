@@ -23,7 +23,7 @@ use crate::flow::check::{
 use crate::flow::interactive::{offer_install_cargo_binstall, offer_install_cargo_update};
 use crate::output::{color_bold, ok_text, print_section, warn_text};
 use crate::profile::parse_profile;
-use crate::selection::{resolve_cli_selection, select_targets};
+use crate::selection::{print_pending_updates, resolve_cli_selection, select_targets};
 use crate::state::{AppState, profile_name};
 use crate::upgrade::upgrade_selected;
 
@@ -132,7 +132,16 @@ async fn finish_after_checks(ctx: &mut RunContext) -> i32 {
         return no_upgrades_exit_code(&ctx.state);
     }
 
-    print_section("选择要升级的项目");
+    if any_check_failed(&ctx.state) {
+        println!(
+            "{}",
+            warn_text("部分目标检查失败，以下仅包含已检测到的更新；详情见上方日志.")
+        );
+    }
+    print_pending_updates(&ctx.state, &upgradable_targets);
+    if ctx.requested_updates.is_empty() {
+        print_section("选择要升级的目标");
+    }
     let selected_targets = select_after_checks(ctx, &upgradable_targets).await;
     selected_upgrade_exit_code(&ctx.state, &selected_targets).await
 }

@@ -1,10 +1,17 @@
-use inquire::{MultiSelect, error::InquireError};
+use crossterm::style::Color as TermColor;
+use inquire::{
+    MultiSelect,
+    error::InquireError,
+    ui::{Attributes, Color, RenderConfig, StyleSheet},
+};
 use std::io::{self, IsTerminal};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::output::print_exit_signal_message;
+use crate::output::{
+    color_bold, package_text, print_exit_signal_message, print_section, warn_text,
+};
 use crate::profile::interactive_terminal;
-use crate::state::{AppState, target_label, updatable_items_for_target};
+use crate::state::{AppState, target_label, target_state_flags, updatable_items_for_target};
 
 #[cfg(test)]
 #[path = "selection_tests.rs"]
@@ -17,9 +24,75 @@ pub enum ScoopBlockedAction {
     Abort,
 }
 
+pub fn print_pending_updates(state: &AppState, targets: &[String]) {
+    print_section("待升级清单");
+    println!("发现 {} 个目标有更新：", targets.len());
+    for target in targets {
+        println!();
+        let items = updatable_items_for_target(state, target);
+        println!(
+            "{}",
+            color_bold(
+                &target_update_heading(target, items.len()),
+                TermColor::Yellow
+            )
+        );
+        if items.is_empty() {
+            println!("  - 检测到更新，但未提供具体条目；执行时由包管理器确认.");
+        } else {
+            for item in items {
+                println!("  - {}", package_text(&item));
+            }
+        }
+        if target_state_flags(state, target).is_some_and(|flags| flags.check_failed) {
+            println!("  {}", warn_text("部分检查失败，更新清单可能不完整."));
+        }
+    }
+    println!();
+    println!("按目标选择升级，具体更新条目见上方清单.");
+}
+
+fn target_update_heading(target: &str, count: usize) -> String {
+    let count = if count == 0 {
+        "有可升级项".to_string()
+    } else {
+        format!("{count} 项更新")
+    };
+    format!("{} ({count})", target_label(target))
+}
+
+fn target_choice_label(state: &AppState, target: &str) -> String {
+    let items = updatable_items_for_target(state, target);
+    let heading = target_update_heading(target, items.len());
+    if items.is_empty() {
+        return heading;
+    }
+    let preview = items
+        .iter()
+        .take(2)
+        .map(|item| {
+            let name = item.split_whitespace().next().unwrap_or(item);
+            let mut chars = name.chars();
+            let short: String = chars.by_ref().take(24).collect();
+            if chars.next().is_some() {
+                format!("{short}…")
+            } else {
+                short
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if items.len() > 2 {
+        format!(" 等 {} 项", items.len())
+    } else {
+        String::new()
+    };
+    format!("{heading} · {preview}{more}")
+}
+
 fn print_target_updatable_items(state: &AppState, target: &str) {
     for item in updatable_items_for_target(state, target) {
-        println!("  - {item}");
+        println!("  - {}", package_text(&item));
     }
 }
 
@@ -99,13 +172,18 @@ pub async fn select_targets(state: &AppState, upgradable_targets: &[String]) -> 
 
     let items: Vec<_> = upgradable_targets
         .iter()
-        .map(|target| {
-            let count = updatable_items_for_target(state, target).len();
-            format!("{} ({count} 项更新)", target_label(target))
-        })
+        .map(|target| target_choice_label(state, target))
         .collect();
     let result = tokio::task::block_in_place(|| {
-        MultiSelect::new("选择要升级的项目", items)
+        let render_config = RenderConfig::default()
+            .with_option(StyleSheet::new().with_fg(Color::LightCyan))
+            .with_selected_option(Some(
+                StyleSheet::new()
+                    .with_fg(Color::LightGreen)
+                    .with_attr(Attributes::BOLD),
+            ));
+        MultiSelect::new("选择要升级的目标", items)
+            .with_render_config(render_config)
             .with_all_selected_by_default()
             .without_filtering()
             .with_help_message("↑/↓: 移动  Space: 勾选  ←: 全不选  →: 全选  Enter: 确认  Esc: 退出")
