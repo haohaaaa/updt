@@ -19,13 +19,13 @@ fn version_matches_the_package() {
 }
 
 #[test]
-fn help_lists_public_commands_and_hides_internal_workers() {
+fn help_lists_cli_commands_without_terminal_mode() {
     let result = cli().arg("--help").assert().success().stderr("");
     let stdout = String::from_utf8_lossy(&result.get_output().stdout);
-    for command in ["update", "terminal", "fish", "completions"] {
+    for command in ["update", "fish", "completions"] {
         assert!(stdout.contains(command), "{stdout}");
     }
-    assert!(!stdout.contains("__terminal"), "{stdout}");
+    assert!(!stdout.contains("terminal"), "{stdout}");
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn completions_cover_public_commands_and_flags_in_each_shell() {
             .success()
             .stderr("");
         let script = String::from_utf8_lossy(&result.get_output().stdout);
-        for item in ["updt", "update", "terminal", "completions", "demo", "shell"] {
+        for item in ["updt", "update", "fish", "completions"] {
             assert!(
                 script.contains(item),
                 "{shell} completion is missing {item}"
@@ -52,10 +52,16 @@ fn completions_cover_public_commands_and_flags_in_each_shell() {
                 );
             }
         }
-        for internal in ["__terminal-worker", "__terminal-demo"] {
+        for removed in [
+            "terminal",
+            "__terminal-worker",
+            "__terminal-demo",
+            "--demo",
+            "--shell",
+        ] {
             assert!(
-                !script.contains(internal),
-                "{shell} completion exposes {internal}"
+                !script.contains(removed),
+                "{shell} completion exposes {removed}"
             );
         }
         assert!(!script.contains("检查可升级项"), "{shell}: {script}");
@@ -77,4 +83,18 @@ fn invalid_update_targets_fail_before_any_checks() {
         .assert()
         .code(2)
         .stdout("");
+}
+
+#[test]
+fn removed_terminal_commands_fail_before_any_checks() {
+    for args in [
+        vec!["terminal"],
+        vec!["terminal", "npm", "cargo"],
+        vec!["terminal", "--demo"],
+        vec!["terminal", "--shell"],
+        vec!["__terminal-demo"],
+        vec!["__terminal-worker", "--owner-pid", "1"],
+    ] {
+        cli().args(args).assert().code(2).stdout("");
+    }
 }

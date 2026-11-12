@@ -58,10 +58,6 @@ pub fn log_pkg_line(pkg: &str, msg: &str, kind: MsgKind) -> String {
 }
 
 pub fn print_section(title: &str) {
-    if crate::terminal::business::is_worker() {
-        crate::terminal::business::notice(&format!("── {title} ──"));
-        return;
-    }
     println!();
     println!(
         "{}",
@@ -69,28 +65,8 @@ pub fn print_section(title: &str) {
     );
 }
 
-/// Application narration goes to the activity view in the embedded UI.
-/// Package output and prompts continue to use stdout directly.
-macro_rules! flow_message {
-    () => { $crate::output::print_flow_message("") };
-    ($($arg:tt)*) => {
-        $crate::output::print_flow_message(&format!($($arg)*))
-    };
-}
-pub(crate) use flow_message;
-
-pub fn print_flow_message(message: &str) {
-    if crate::terminal::business::is_worker() {
-        crate::terminal::business::notice(&crate::parse::strip_ansi_control_sequences(message));
-    } else {
-        println!("{message}");
-    }
-}
-
 pub fn print_command(command: &str) {
-    if !crate::terminal::business::is_worker() {
-        println!("\n{}", color_bold(&format!("$ {command}"), TermColor::Cyan));
-    }
+    println!("\n{}", color_bold(&format!("$ {command}"), TermColor::Cyan));
 }
 
 pub fn print_exit_signal_message() {

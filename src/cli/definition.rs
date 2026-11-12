@@ -20,30 +20,6 @@ pub fn build_cli() -> ClapCommand {
                 ),
         )
         .subcommand(
-            ClapCommand::new("terminal")
-                .about("Check and update packages in an embedded interactive terminal")
-                .arg(
-                    Arg::new("demo")
-                        .long("demo")
-                        .action(clap::ArgAction::SetTrue)
-                        .conflicts_with_all(["shell", "targets"])
-                        .help("Try terminal interaction without running the update workflow"),
-                )
-                .arg(
-                    Arg::new("shell")
-                        .long("shell")
-                        .action(clap::ArgAction::SetTrue)
-                        .conflicts_with("targets")
-                        .help("Open a shell without running the update workflow"),
-                )
-                .arg(
-                    Arg::new("targets")
-                        .num_args(0..)
-                        .value_delimiter(',')
-                        .value_parser(PossibleValuesParser::new(TARGET_IDS)),
-                ),
-        )
-        .subcommand(
             ClapCommand::new("fish")
                 .about("Install fish completion to the user's fish configuration directory"),
         )

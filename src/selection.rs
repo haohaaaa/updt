@@ -30,30 +30,14 @@ pub async fn select_targets_prompt(state: &AppState, upgradable_targets: &[Strin
     let mut stdout = tokio::io::stdout();
 
     for target in upgradable_targets {
-        crate::terminal::business::report(target, crate::terminal::business::Status::Confirming);
         println!("{}", target_label(target));
         print_target_updatable_items(state, target);
         match prompt_target_upgrade(&mut stdin, &mut stdout, target).await {
             PromptAnswer::Yes => {
                 selected_targets.push(target.clone());
-                crate::terminal::business::report(
-                    target,
-                    crate::terminal::business::Status::Queued,
-                );
             }
-            PromptAnswer::No => crate::terminal::business::report(
-                target,
-                crate::terminal::business::Status::Skipped,
-            ),
-            PromptAnswer::Abort => {
-                for target in upgradable_targets {
-                    crate::terminal::business::report(
-                        target,
-                        crate::terminal::business::Status::Cancelled,
-                    );
-                }
-                return Vec::new();
-            }
+            PromptAnswer::No => {}
+            PromptAnswer::Abort => return Vec::new(),
         }
     }
     selected_targets
@@ -146,9 +130,6 @@ pub async fn select_targets(state: &AppState, upgradable_targets: &[String]) -> 
 
 pub fn resolve_cli_selection(requested: &[String], upgradable_targets: &[String]) -> Vec<String> {
     let (selected, skipped) = resolve_cli_selection_quiet(requested, upgradable_targets);
-    for target in &selected {
-        crate::terminal::business::report(target, crate::terminal::business::Status::Queued);
-    }
     for target in &skipped {
         println!("[cli] {} 当前没有可升级项, 跳过.", target_label(target));
     }

@@ -51,9 +51,7 @@ fn spawn_check_workers(
         let tx_task = tx.clone();
         set.spawn(async move {
             let _ = tx_task.send(CheckEvent::Started(t.clone()));
-            crate::terminal::business::report(&t, crate::terminal::business::Status::Checking);
             let result = run_single_check(&t).await;
-            crate::terminal::business::checked(&t, &result.state);
             let (kind, summary) = summarize_target_status(&t, &result.state);
             let _ = tx_task.send(CheckEvent::Finished {
                 target: t,
@@ -91,9 +89,6 @@ pub async fn run_checks_plain(state: &mut AppState, targets: &[String]) {
 }
 
 fn print_check_header(targets: &[String]) {
-    if crate::terminal::business::is_worker() {
-        return;
-    }
     println!(
         "{} {}",
         color_bold("[check]", TermColor::Yellow),
@@ -108,9 +103,6 @@ fn print_check_header(targets: &[String]) {
 async fn print_check_events(rx: &mut mpsc::UnboundedReceiver<CheckEvent>, target_count: usize) {
     let progress = check_progress(target_count);
     while let Some(event) = rx.recv().await {
-        if crate::terminal::business::is_worker() {
-            continue;
-        }
         let line = check_event_line(&event);
         if let Some(progress) = &progress {
             if matches!(event, CheckEvent::Finished { .. }) {
@@ -127,7 +119,7 @@ async fn print_check_events(rx: &mut mpsc::UnboundedReceiver<CheckEvent>, target
 }
 
 fn check_progress(target_count: usize) -> Option<ProgressBar> {
-    if target_count == 0 || crate::terminal::business::is_worker() || !interactive_terminal() {
+    if target_count == 0 || !interactive_terminal() {
         return None;
     }
     let draw_target = ProgressDrawTarget::stdout_with_hz(10);
@@ -160,11 +152,7 @@ fn check_event_line(event: &CheckEvent) -> String {
 
 fn print_check_logs(targets: &[String], logs_map: &HashMap<String, Vec<String>>) {
     for target in targets {
-        if crate::terminal::business::is_worker() {
-            println!("\n── {} · 检查结果 ──", section_title(target));
-        } else {
-            print_section(section_title(target));
-        }
+        print_section(section_title(target));
         if let Some(lines) = logs_map.get(target) {
             print_lines(lines);
         }
