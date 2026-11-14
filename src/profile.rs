@@ -12,11 +12,13 @@ pub async fn parse_profile(state: &mut AppState) {
             .is_ok();
     state.is_arch_linux = fs::metadata("/etc/arch-release").await.is_ok();
     state.is_asahi_linux = if env::consts::OS == "linux" {
-        fs::read_to_string("/etc/os-release")
+        let release = fs::read_to_string("/etc/os-release")
             .await
-            .ok()
-            .and_then(|content| os_release_id(&content).map(|id| id == "fedora-asahi-remix"))
-            .unwrap_or(false)
+            .unwrap_or_default();
+        let compatible = fs::read("/proc/device-tree/compatible")
+            .await
+            .unwrap_or_default();
+        is_asahi_release(&release, &compatible)
     } else {
         false
     };
@@ -29,6 +31,16 @@ pub async fn parse_profile(state: &mut AppState) {
             state.is_asahi_linux,
         ),
     );
+}
+
+fn is_asahi_release(release: &str, compatible: &[u8]) -> bool {
+    match os_release_id(release) {
+        Some("fedora-asahi-remix") => true,
+        Some("fedora") => compatible
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"apple,arm-platform"),
+        _ => false,
+    }
 }
 
 fn os_release_id(content: &str) -> Option<&str> {
@@ -138,7 +150,7 @@ pub fn desktop_linux_session() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_profile_policy, detect_profile, os_release_id};
+    use super::{apply_profile_policy, detect_profile, is_asahi_release, os_release_id};
     use crate::state::{AppState, SystemProfile, profile_name};
 
     #[test]
@@ -146,6 +158,7 @@ mod tests {
         let release = "NAME=\"Fedora Linux Asahi Remix\"\nID=fedora-asahi-remix\nID_LIKE=fedora\n";
 
         assert_eq!(os_release_id(release), Some("fedora-asahi-remix"));
+        assert!(is_asahi_release(release, b""));
         assert_eq!(
             detect_profile("linux", false, false, true),
             SystemProfile::Asahi
@@ -155,11 +168,27 @@ mod tests {
     #[test]
     fn generic_fedora_and_missing_release_ids_remain_unknown() {
         assert_eq!(os_release_id("ID=fedora\n"), Some("fedora"));
+        assert!(!is_asahi_release("ID=fedora\n", b"other,platform\0"));
+        assert!(!is_asahi_release("ID=other\n", b"apple,arm-platform\0"));
+        assert!(!is_asahi_release(
+            "NAME=Fedora Linux\n",
+            b"apple,arm-platform\0"
+        ));
         assert_eq!(os_release_id("NAME=Fedora Linux\n"), None);
         assert_eq!(
             detect_profile("linux", false, false, false),
             SystemProfile::Unknown
         );
+    }
+
+    #[test]
+    fn recognizes_fedora_on_apple_silicon_as_asahi() {
+        let compatible = b"apple,j416s\0apple,t6020\0apple,arm-platform\0";
+        assert!(is_asahi_release("ID=fedora\n", compatible));
+        assert!(!is_asahi_release(
+            "ID=fedora\n",
+            b"apple,arm-platform-extra\0"
+        ));
     }
 
     #[test]

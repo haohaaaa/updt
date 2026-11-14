@@ -915,7 +915,7 @@ checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
 
 [[package]]
 name = "updt"
-version = "5.1.0"
+version = "5.1.1"
 dependencies = [
  "assert_cmd",
  "chrono",
